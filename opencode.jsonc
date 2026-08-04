@@ -1,0 +1,30 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "b24cowork",
+  "mcp": {
+    "openwork-browser": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64883/mcp"
+    },
+    "chrome": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64884/mcp"
+    },
+    "bitrix24": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64886/mcp"
+    },
+    "attachments": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64888/mcp"
+    },
+    "vibecode": {
+      "type": "remote",
+      "url": "http://127.0.0.1:64887/mcp?ws=%2FUsers%2Fekaterinafeneva%2F.local%2Fshare%2Fbitrix24-cowork%2Fcode%2F195dd31e218cb401"
+    },
+    "openwork-ui": {
+      "type": "remote",
+      "url": "http://127.0.0.1:62166/mcp"
+    }
+  }
+}
