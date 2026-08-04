@@ -35,7 +35,6 @@ const TASK_TIME_CHECK_ENABLED = process.env.TASK_TIME_CHECK_ENABLED !== 'false';
 const TASK_TIME_CHECK_RUN_ON_START = process.env.TASK_TIME_CHECK_RUN_ON_START !== 'false';
 const TASK_TIME_ALERT_RETENTION_DAYS = Number(process.env.TASK_TIME_ALERT_RETENTION_DAYS || 180);
 const API_REQUEST_TIMEOUT_MS = Number(process.env.API_REQUEST_TIMEOUT_MS || 60 * 1000);
-const SERVER_SLEEP_MODE = process.env.SERVER_SLEEP_MODE === 'true';
 
 let taskTimeCheckInProgress = false;
 let taskTimeCheckStartedAt = null;
@@ -949,18 +948,6 @@ async function processClosedTask(taskId) {
 async function handleWebhook(body) {
   const data = parseFormUrlEncoded(body);
 
-  if (SERVER_SLEEP_MODE) {
-    return {
-      statusCode: 200,
-      data: {
-        ok: true,
-        sleeping: true,
-        reason: 'server_sleep_mode_enabled',
-        event: data.event || null,
-      },
-    };
-  }
-
   const taskId = getTaskIdFromOutgoingWebhook(data);
   if (!taskId) throw new Error('No task ID found');
 
@@ -1027,7 +1014,6 @@ const server = http.createServer(async (req, res) => {
     if ((req.method === 'GET' || req.method === 'HEAD') && pathname === '/debug') {
       sendJson(res, 200, {
         ok: true,
-        sleeping: SERVER_SLEEP_MODE,
         taskTimeCheckRunning: taskTimeCheckInProgress,
         taskTimeCheckStartedAt,
         taskTimeCheckStage,
@@ -1038,15 +1024,6 @@ const server = http.createServer(async (req, res) => {
 
     if ((req.method === 'GET' || req.method === 'POST') && pathname === '/time-check') {
       if (req.method === 'POST') await readBody(req);
-      if (SERVER_SLEEP_MODE) {
-        sendJson(res, 200, {
-          ok: true,
-          sleeping: true,
-          reason: 'server_sleep_mode_enabled',
-        });
-        return;
-      }
-
       const result = await runTaskTimeCheck();
       sendJson(res, 200, result);
       return;
@@ -1081,11 +1058,6 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   log(`Server running on port ${PORT}`);
-
-  if (SERVER_SLEEP_MODE) {
-    log('Server sleep mode enabled');
-    return;
-  }
 
   if (!TASK_TIME_CHECK_ENABLED) return;
 
