@@ -35,7 +35,7 @@ const TASK_TIME_CHECK_ENABLED = process.env.TASK_TIME_CHECK_ENABLED !== 'false';
 const TASK_TIME_CHECK_RUN_ON_START = process.env.TASK_TIME_CHECK_RUN_ON_START !== 'false';
 const TASK_TIME_ALERT_RETENTION_DAYS = Number(process.env.TASK_TIME_ALERT_RETENTION_DAYS || 180);
 const API_REQUEST_TIMEOUT_MS = Number(process.env.API_REQUEST_TIMEOUT_MS || 60 * 1000);
-const SERVER_SLEEP_MODE = process.env.SERVER_SLEEP_MODE !== 'false';
+const SERVER_SLEEP_MODE = process.env.SERVER_SLEEP_MODE === 'true';
 
 let taskTimeCheckInProgress = false;
 let taskTimeCheckStartedAt = null;
