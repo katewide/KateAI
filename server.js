@@ -32,7 +32,7 @@ const DB_PATH = process.env.DB_PATH || './task_time_logs.db';
 const TASK_TIME_LOOKBACK_DAYS = Number(process.env.TASK_TIME_LOOKBACK_DAYS || 10);
 const TASK_TIME_CHECK_INTERVAL_MS = Number(process.env.TASK_TIME_CHECK_INTERVAL_MS || 4 * 60 * 60 * 1000);
 const TASK_TIME_CHECK_ENABLED = process.env.TASK_TIME_CHECK_ENABLED !== 'false';
-const TASK_TIME_CHECK_RUN_ON_START = process.env.TASK_TIME_CHECK_RUN_ON_START !== 'false';
+const TASK_TIME_CHECK_RUN_ON_START = process.env.TASK_TIME_CHECK_RUN_ON_START === 'true';
 const TASK_TIME_ALERT_RETENTION_DAYS = Number(process.env.TASK_TIME_ALERT_RETENTION_DAYS || 180);
 const API_REQUEST_TIMEOUT_MS = Number(process.env.API_REQUEST_TIMEOUT_MS || 60 * 1000);
 
@@ -965,12 +965,11 @@ async function handleWebhook(body) {
   const actions = [];
 
   // Ветка 1: изменение ответственного, добавление прошлого исполнителя в соисполнители.
-  // Сейчас отключено.
-  // const previousResponsibleId = normalizeId(responsibleChange?.value?.from);
-  // if (previousResponsibleId) {
-  //   const result = await addAccomplice(taskId, previousResponsibleId);
-  //   actions.push({ branch: 'responsible_changed', ...result });
-  // }
+  const previousResponsibleId = normalizeId(responsibleChange?.value?.from);
+  if (previousResponsibleId) {
+    const result = await addAccomplice(taskId, previousResponsibleId);
+    actions.push({ branch: 'responsible_changed', ...result });
+  }
 
   // Ветка 2: закрытие задачи, сбор контекста и вызов Геммы.
   if (String(statusChange?.value?.to) === '5') {
