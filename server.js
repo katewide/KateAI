@@ -29,18 +29,23 @@ const WEBHOOK_TOKEN = requireEnv('WEBHOOK_TOKEN');
 const ELAPSED_NOTIFICATION_CHAT_ID = process.env.ELAPSED_NOTIFICATION_CHAT_ID || 'chat42358';
 const BITRIX_PORTAL_URL = process.env.BITRIX_PORTAL_URL || 'https://elros.bitrix24.ru';
 const DB_PATH = process.env.DB_PATH || './task_time_logs.db';
-const TASK_TIME_LOOKBACK_DAYS = Number(process.env.TASK_TIME_LOOKBACK_DAYS || 10);
-const TASK_TIME_CHECK_INTERVAL_MS = Number(process.env.TASK_TIME_CHECK_INTERVAL_MS || 4 * 60 * 60 * 1000);
+const TASK_TIME_LOOKBACK_DAYS = Number(process.env.TASK_TIME_LOOKBACK_DAYS || 180);
+const TASK_TIME_CHECK_HOUR_MSK = Number(process.env.TASK_TIME_CHECK_HOUR_MSK || 20);
+const TASK_TIME_CHECK_MINUTE_MSK = Number(process.env.TASK_TIME_CHECK_MINUTE_MSK || 0);
 const TASK_TIME_CHECK_ENABLED = process.env.TASK_TIME_CHECK_ENABLED !== 'false';
 const TASK_TIME_CHECK_RUN_ON_START = process.env.TASK_TIME_CHECK_RUN_ON_START === 'true';
 const TASK_TIME_ALERT_RETENTION_DAYS = Number(process.env.TASK_TIME_ALERT_RETENTION_DAYS || 180);
 const API_REQUEST_TIMEOUT_MS = Number(process.env.API_REQUEST_TIMEOUT_MS || 60 * 1000);
+const MSK_UTC_OFFSET_HOURS = 3;
 
 let taskTimeCheckInProgress = false;
 let taskTimeCheckStartedAt = null;
 let taskTimeCheckStage = null;
 const debugState = {
   lastRequest: null,
+  lastTaskTimeCheckRequest: null,
+  nextTaskTimeCheck: null,
+  lastTaskTimeChatDecision: null,
   lastTaskTimeCheck: null,
   lastError: null,
 };
@@ -404,7 +409,15 @@ async function fetchClosedTasksForTimeCheck() {
   const tasks = [];
 
   for (let offset = 0; ; offset += 5000) {
-    const response = await coworkRequest('GET', `/tasks?${buildTaskListQuery(offset)}`);
+    const path = `/tasks?${buildTaskListQuery(offset)}`;
+    saveDebug('lastTaskTimeCheckRequest', {
+      method: 'GET',
+      path,
+      offset,
+      stage: 'fetch_closed_tasks',
+    });
+
+    const response = await coworkRequest('GET', path);
     const pageTasks = normalizeTaskListPayload(response);
     tasks.push(...pageTasks);
 
@@ -527,6 +540,10 @@ function getHistoryUserName(historyItem) {
   return fullName || 'Неизвестный пользователь';
 }
 
+function getHistoryUserId(historyItem) {
+  return historyItem?.user?.id || historyItem?.userId || historyItem?.USER_ID || null;
+}
+
 function getHistoryTimeDiffMinutes(historyItem) {
   const from = Number.parseInt(historyItem?.value?.from ?? 0, 10);
   const to = Number.parseInt(historyItem?.value?.to ?? 0, 10);
@@ -558,6 +575,7 @@ async function getTimeHistoryChangesForTask(task, previousState, fallbackChange)
       taskLink,
       title: getTaskTitle(task),
       groupId: getGroupIdFromTask(task),
+      userId: getHistoryUserId(item),
       userName: getHistoryUserName(item),
       oldTimeSpent: Number.parseInt(item.value?.from ?? 0, 10) || 0,
       newTimeSpent: Number.parseInt(item.value?.to ?? 0, 10) || 0,
@@ -572,10 +590,32 @@ async function getTimeHistoryChangesForTask(task, previousState, fallbackChange)
 
   return [{
     ...fallbackChange,
+    userId: null,
     userName: 'Неизвестный пользователь',
     history_id: null,
     history_created_date: null,
   }];
+}
+
+function saveTimeChatDecision(changes, message) {
+  const taskIds = [...new Set(changes.map(change => change.taskId))];
+  const users = [...new Map(changes.map(change => [
+    `${change.userId || ''}:${change.userName || 'Неизвестный пользователь'}`,
+    {
+      user_id: change.userId || null,
+      user_name: change.userName || 'Неизвестный пользователь',
+    },
+  ])).values()];
+
+  saveDebug('lastTaskTimeChatDecision', {
+    sent: Boolean(message),
+    reason: changes.length > 0 ? 'time_changes_found' : 'no_time_changes',
+    chat_id: ELAPSED_NOTIFICATION_CHAT_ID,
+    changed_tasks: taskIds.length,
+    changed_time_events: changes.length,
+    task_ids: taskIds,
+    users,
+  });
 }
 
 function buildTimeChangesMessage(changes) {
@@ -642,6 +682,13 @@ async function runTaskTimeCheck() {
   taskTimeCheckInProgress = true;
   taskTimeCheckStartedAt = new Date().toISOString();
   taskTimeCheckStage = 'fetch_closed_tasks';
+  saveDebug('lastTaskTimeCheckRequest', {
+    method: 'START',
+    path: null,
+    stage: taskTimeCheckStage,
+    scheduled_hour_msk: TASK_TIME_CHECK_HOUR_MSK,
+    scheduled_minute_msk: TASK_TIME_CHECK_MINUTE_MSK,
+  });
 
   try {
     const tasks = await fetchClosedTasksForTimeCheck();
@@ -695,6 +742,7 @@ async function runTaskTimeCheck() {
 
     taskTimeCheckStage = 'send_chat_report';
     const message = await sendTimeChangesReport(changes);
+    saveTimeChatDecision(changes, message);
 
     taskTimeCheckStage = 'save_changed_tasks';
     for (const change of changes) {
@@ -999,6 +1047,45 @@ function sendJson(res, statusCode, data) {
   res.end(JSON.stringify(data));
 }
 
+function getNextTaskTimeCheckDate(now = new Date()) {
+  const scheduledUtcHour = TASK_TIME_CHECK_HOUR_MSK - MSK_UTC_OFFSET_HOURS;
+  const nextRun = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    scheduledUtcHour,
+    TASK_TIME_CHECK_MINUTE_MSK,
+    0,
+    0
+  ));
+
+  if (nextRun <= now) {
+    nextRun.setUTCDate(nextRun.getUTCDate() + 1);
+  }
+
+  return nextRun;
+}
+
+function scheduleNextTaskTimeCheck() {
+  const nextRun = getNextTaskTimeCheckDate();
+  const delayMs = Math.max(0, nextRun.getTime() - Date.now());
+
+  saveDebug('nextTaskTimeCheck', {
+    scheduled_at_utc: nextRun.toISOString(),
+    scheduled_at_msk: `${nextRun.toISOString().slice(0, 10)}T${String(TASK_TIME_CHECK_HOUR_MSK).padStart(2, '0')}:${String(TASK_TIME_CHECK_MINUTE_MSK).padStart(2, '0')}:00+03:00`,
+    delay_ms: delayMs,
+  });
+
+  setTimeout(() => {
+    runTaskTimeCheck()
+      .catch(error => {
+        saveDebug('lastError', { error: error.message });
+        log('Task time check failed', { error: error.message });
+      })
+      .finally(scheduleNextTaskTimeCheck);
+  }, delayMs);
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const pathname = req.url.split('?')[0];
@@ -1069,10 +1156,5 @@ server.listen(PORT, () => {
     }, 5000);
   }
 
-  setInterval(() => {
-    runTaskTimeCheck().catch(error => {
-      saveDebug('lastError', { error: error.message });
-      log('Task time check failed', { error: error.message });
-    });
-  }, TASK_TIME_CHECK_INTERVAL_MS);
+  scheduleNextTaskTimeCheck();
 });
