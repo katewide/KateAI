@@ -314,6 +314,16 @@ function getResponsibleIdFromTask(task) {
   return responsibleId ? String(responsibleId).replace(/^user_/i, '') : null;
 }
 
+function getCreatorIdFromTask(task) {
+  const creatorId = (
+    task?.createdBy ||
+    task?.creatorId ||
+    task?.CREATED_BY ||
+    task?.creator?.id
+  );
+  return creatorId ? String(creatorId).replace(/^user_/i, '') : null;
+}
+
 function getGroupNameFromTask(task) {
   return task?.groupName || task?.group?.name || task?.group?.title || null;
 }
@@ -825,10 +835,11 @@ function findLatestFieldChange(updateBatch, fieldName) {
   return updateBatch.find(item => normalizeHistoryField(item.field) === normalizedFieldName && item.value);
 }
 
-function buildPrompt({ taskId, responsibleId, mainTask, mainComments, contextparentID }) {
+function buildPrompt({ taskId, responsibleId, creatorId, mainTask, mainComments, contextparentID }) {
   const context = {
     currentTaskId: taskId,
     responsibleId,
+    creatorId,
     currentTask: mainTask,
     currentTaskComments: mainComments,
   };
@@ -959,6 +970,7 @@ async function processClosedTask(taskId) {
   const { task: mainTask, comments: mainComments } = await fetchTaskWithComments(taskId);
   const parentId = getParentIdFromTask(mainTask);
   const responsibleId = getResponsibleIdFromTask(mainTask);
+  const creatorId = getCreatorIdFromTask(mainTask);
   const groupId = getGroupIdFromTask(mainTask);
   const groupName = getGroupNameFromTask(mainTask);
   const timeLogs = await fetchTaskTimeLogs(taskId);
@@ -994,7 +1006,7 @@ async function processClosedTask(taskId) {
     model: MODEL_NAME,
     messages: [{
       role: 'user',
-      content: buildPrompt({ taskId, responsibleId, mainTask, mainComments, contextparentID }),
+      content: buildPrompt({ taskId, responsibleId, creatorId, mainTask, mainComments, contextparentID }),
     }],
   });
 
@@ -1010,6 +1022,7 @@ async function processClosedTask(taskId) {
     task_id: taskId,
     parent_id: parentId || null,
     responsible_id: responsibleId,
+    creator_id: creatorId,
     group_id: groupId || null,
     group_name: groupName || null,
     time_logs_count: timeLogs.length,
