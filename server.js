@@ -549,6 +549,10 @@ function getAttachmentFields(object) {
   ];
 }
 
+function getCommentMessage(comment) {
+  return comment?.message || comment?.MESSAGE || comment?.text || comment?.TEXT || '';
+}
+
 function getObjectImageCandidate(object, source) {
   if (!object || typeof object !== 'object') return null;
 
@@ -579,8 +583,8 @@ function getObjectImageCandidate(object, source) {
   };
 }
 
-function collectImageCandidates(value, source, depth = 0, seen = new Set()) {
-  if (!AI_IMAGE_PROCESSING_ENABLED || depth > 5 || value == null) return [];
+function collectImageCandidates(value, source, depth = 0) {
+  if (!AI_IMAGE_PROCESSING_ENABLED || depth > 3 || value == null) return [];
 
   if (typeof value === 'string') {
     const trimmed = value.trim();
@@ -602,11 +606,10 @@ function collectImageCandidates(value, source, depth = 0, seen = new Set()) {
   }
 
   if (Array.isArray(value)) {
-    return value.flatMap((item, index) => collectImageCandidates(item, `${source}[${index}]`, depth + 1, seen));
+    return value.flatMap((item, index) => collectImageCandidates(item, `${source}[${index}]`, depth + 1));
   }
 
-  if (typeof value !== 'object' || seen.has(value)) return [];
-  seen.add(value);
+  if (typeof value !== 'object') return [];
 
   const candidates = [];
   const objectCandidate = getObjectImageCandidate(value, source);
@@ -616,10 +619,6 @@ function collectImageCandidates(value, source, depth = 0, seen = new Set()) {
     for (const fileId of getKnownFileIds(attachmentField)) {
       candidates.push({ source, name: null, mimeType: null, fileId });
     }
-  }
-
-  for (const [key, item] of Object.entries(value)) {
-    candidates.push(...collectImageCandidates(item, `${source}.${key}`, depth + 1, seen));
   }
 
   return candidates;
@@ -674,12 +673,19 @@ async function downloadImageCandidate(candidate) {
 
 async function prepareTaskImages(task, comments, scope) {
   const candidates = dedupeImageCandidates([
-    ...collectImageCandidates(task, `${scope}.task`),
-    ...comments.flatMap(comment => collectImageCandidates(comment, `${scope}.comment:${comment?.id || comment?.ID || 'unknown'}`)),
-  ]).slice(0, AI_MAX_IMAGES);
+    ...getAttachmentFields(task).flatMap(field => collectImageCandidates(field, `${scope}.task.attachments`)),
+    ...comments.flatMap(comment => {
+      const commentSource = `${scope}.comment:${comment?.id || comment?.ID || 'unknown'}`;
+      return [
+        ...collectImageCandidates(getCommentMessage(comment), `${commentSource}.message`),
+        ...getAttachmentFields(comment).flatMap(field => collectImageCandidates(field, `${commentSource}.attachments`)),
+      ];
+    }),
+  ]);
 
   const images = [];
   for (const candidate of candidates) {
+    if (images.length >= AI_MAX_IMAGES) break;
     try {
       const image = await downloadImageCandidate(candidate);
       if (image?.dataUrl) images.push(image);
