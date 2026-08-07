@@ -37,6 +37,8 @@ const TASK_TIME_CHECK_RUN_ON_START = process.env.TASK_TIME_CHECK_RUN_ON_START ==
 const TASK_TIME_ALERT_RETENTION_DAYS = Number(process.env.TASK_TIME_ALERT_RETENTION_DAYS || 180);
 const API_REQUEST_TIMEOUT_MS = Number(process.env.API_REQUEST_TIMEOUT_MS || 60 * 1000);
 const MSK_UTC_OFFSET_HOURS = 3;
+const GEMMA_EXCLUDED_GROUP_IDS = new Set(['12', '92', '376', '490']);
+const GEMMA_COMMENT_AUTHOR_ID = String(process.env.GEMMA_COMMENT_AUTHOR_ID || 204);
 
 let taskTimeCheckInProgress = false;
 let taskTimeCheckStartedAt = null;
@@ -332,6 +334,10 @@ function isCollabGroupName(groupName) {
   return String(groupName || '').toLowerCase().includes('коллаба');
 }
 
+function isGemmaExcludedGroupId(groupId) {
+  return GEMMA_EXCLUDED_GROUP_IDS.has(String(groupId || ''));
+}
+
 function getTaskTitle(task) {
   return task?.title || task?.TITLE || '';
 }
@@ -360,6 +366,23 @@ function normalizeCommentsPayload(response) {
   const data = unwrapData(response);
   const comments = data?.comments || data?.Comments || data?.items || data?.list || data;
   return Array.isArray(comments) ? comments : [];
+}
+
+function getCommentAuthorId(comment) {
+  const authorId = (
+    comment?.authorId ??
+    comment?.AUTHOR_ID
+  );
+
+  return authorId == null ? null : String(authorId).replace(/^user_/i, '');
+}
+
+function isGemmaComment(comment) {
+  return getCommentAuthorId(comment) === GEMMA_COMMENT_AUTHOR_ID;
+}
+
+function filterGemmaComments(comments) {
+  return comments.filter(comment => !isGemmaComment(comment));
 }
 
 function normalizeTimePayload(response) {
@@ -835,13 +858,20 @@ function findLatestFieldChange(updateBatch, fieldName) {
   return updateBatch.find(item => normalizeHistoryField(item.field) === normalizedFieldName && item.value);
 }
 
-function buildPrompt({ taskId, responsibleId, creatorId, mainTask, mainComments, contextparentID }) {
+function isInsufficientInfoComment(comment) {
+  return String(comment || '').includes('Недостаточно информации');
+}
+
+function buildPrompt({ taskId, groupId, responsibleId, creatorId, mainTask, mainComments, mainTimeLogs, mainTimeSpentInLogs, contextparentID }) {
   const context = {
     currentTaskId: taskId,
+    groupId,
     responsibleId,
     creatorId,
     currentTask: mainTask,
     currentTaskComments: mainComments,
+    currentTaskTime: mainTimeLogs,
+    currentTaskTimeSpentInLogs: mainTimeSpentInLogs,
   };
 
   return `Ты - профессиональный консультант 1С. Твоя задача - проанализировать данные задачи и написать краткий итог. Ты анализируешь задачи компании-франчайзи 1С. Используй профессиональную терминологию, принятую в сфере внедрения и сопровождения продуктов 1С.
@@ -853,8 +883,8 @@ ${JSON.stringify(context, null, 2)}
 ${JSON.stringify(contextparentID, null, 2)}
 
 Правила анализа:
-- Основной объект анализа - currentTask и currentTaskComments.
-- Если контекст родительской задачи не равен null, используй parentTask и parentTaskComments только как дополнительный контекст.
+- Основной объект анализа - currentTask, currentTaskComments, currentTaskTimeSpentInLogs, currentTaskId.
+- Если контекст родительской задачи не равен null, используй parentTask, parentTaskComments, parentTaskTimeSpentInLogs только как дополнительный контекст.
 - Если есть несоответствие данных задачи и комментариев, ориентируйся на комментарии.
 - Используй только информацию, содержащуюся в JSON. Ничего не выдумывай и не добавляй от себя.
 - Не добавляй технические детали, если они отсутствуют в исходных данных.
@@ -886,22 +916,37 @@ ${JSON.stringify(contextparentID, null, 2)}
 - "пользователь не может зайти", "права слетели", "дать доступ к складу" -> настройка прав доступа / назначение профилей групп доступа / ограничение прав/ролей пользователя.
 - "программа зависла", "всех выбило", "ошибка СУБД" -> аварийное завершение сеанса / оптимизация работы сервера 1С:Предприятие.
 
+ИЗВЛЕЧЕНИЕ ФАЙЛОВ (внутренний этап, не выводить пользователю):
+Перед формированием результата последовательно определи:
+- какая подтвержденная проблема была выявлена;
+- какой подтвержденный запрос был поставлен;
+- какие действия действительно выполнены;
+- какой подтвержденный результат получен.
+Используй только факты, прямо подтвержденные JSON.
+Если какого-либо пункта нет — считай его отсутствующим, а не предполагаемым.
+
+Правила технической точности:
+- Не называй объекты 1С, механизмы, регистры, документы, обработки, отчеты, обмены, расширения, релизы или настройки, если они прямо не указаны в JSON.
+- Если указан конкретный объект 1С, сохрани его название максимально близко к исходному тексту.
+
 ЗАДАНИЕ:
 Сформируй результат строго в следующем формате.
 
 [b]✅ SUMMARY:[/b]
-В 1-2 предложениях кратко, но максимально полно опиши суть задачи. Обязательно укажи:
-- какая проблема или запрос были у клиента;
-- каким способом проблема была решена или какие работы были выполнены.
-- Не используй оценочные или шаблонные формулировки, такие как: "задача успешно решена", "работы успешно выполнены", "проблема полностью устранена", "вопрос закрыт" и аналогичные.
-- Не используй слова "успешно", "полностью", "окончательно", "окончательно решена", если это прямо не указано в предоставленных данных.
+В 2-4 предложениях максимально полно, но кратко опиши суть задачи. Обязательно укажи:
+- Сначала укажи суть проблемы или запроса клиента.
+- Затем укажи выполненные действия, предложенное решение или результат проверки.
+- Если есть подтвержденный результат, последнее предложение должно отражать этот результат.
+- Отдавай предпочтение точности, затем краткости.
+- Не добавляй оценочные формулировки и не усиливай результат словами "полностью", "окончательно", "успешно"
 
 [b]📝 TITLE:[/b]
-- Предложи 2 наиболее подходящих варианта наименования задачи.
-- Каждый вариант должен содержать от 3 до 20 слов.
-- Название должно быть кратким, но максимально точно отражать выполненную работу.
-- Если основная суть задачи - консультация или предоставление информации, начинай название со слов "Консультация по...".
-- Если основная суть задачи - выполнение работ, настройка, исправление, разработка, подключение, обновление или иные действия, начинай название со слов "Проведение работ по...".
+- Выведи только один вариант TITLE.
+- TITLE должен быть максимально точным и полным, но без лишних деталей.
+- TITLE должен содержать от 3 до 25 слов.
+- Если задача является консультацией, начни TITLE со слов "Консультация по...".
+- Если в задаче выполнены работы, настройка, исправление, разработка, подключение, обновление или проверка, начни TITLE со слов "Проведение работ по...".
+- Если задача содержит одновременно:одтвержденную проблему и подтвержденное решение,то TITLE формируется по схеме: <Проблема>. Решение: <способ устранения>.
 - Не используй общие или расплывчатые формулировки.
 - Не добавляй никаких пояснений, вступлений, комментариев или рассуждений.
 
@@ -926,6 +971,12 @@ ${JSON.stringify(contextparentID, null, 2)}
 ⚠️ [b]Недостаточно информации.[/b] [USER=<responsibleId>]Исполнитель[/USER], пожалуйста, напиши пояснения.
 - Не добавляй никаких других комментариев или пояснений.
 
+Проверка времени в задаче:
+1. Используй значение currentTaskTimeSpentInLogs как фактическое время по текущей задаче.
+2. Если currentTaskTimeSpentInLogs равно 0 и из JSON задачи и базовой задачи невозможно определить, в чем заключалась проблема или какие действия были выполнены, не выводи разделы ✅ SUMMARY и 📝 TITLE. В этом случае ничего не выводи, сообщение не пиши.
+3. Если currentTaskTimeSpentInLogs больше 0 и из JSON задачи и базовой задачи невозможно определить, в чем заключалась проблема или какие действия были выполнены, обработай задачу по правилу "Проверка достаточности информации".
+- Не используй currentTaskTimeSpentInLogs как источник описания проблемы или выполненных работ.
+
 Упоминание исполнителя:
 - Используй значение переменной responsibleId.
 - Выведи его в формате: [USER=<responsibleId>]Исполнитель[/USER]
@@ -941,21 +992,28 @@ ${JSON.stringify(contextparentID, null, 2)}
 Для обычных задач:
 
 [b]✅ SUMMARY:[/b]
-<1-2 предложения>
+<2-4 предложения:проблема/запрос, выполненные или предложенные действия, подтвержденный результат при наличии>
 
 [b]📝 TITLE:[/b]
-1. ...
-2. ...
+<Одно наиболее точное название>
+
+Для задач из группы с id = 276:
+- Если groupId текущей задачи равен 276, выведи только раздел ✅ SUMMARY:
+
+[b]✅ SUMMARY:[/b]
+<2-4 предложения:проблема/запрос, выполненные или предложенные действия, подтвержденный результат при наличии>
+
+- Раздел 📝 TITLE не выводи.
 
 Для задач "Обновление базы", если обновление выполнено на тот же релиз:
 
 [b]✅ SUMMARY:[/b]
-<1-2 предложения>
+<2-4 предложения:проблема/запрос, выполненные или предложенные действия, подтвержденный результат при наличии>
 
 Для задач "Обновление базы", если обновление выполнено на другой релиз:
 
 [b]✅ SUMMARY:[/b]
-<1-2 предложения>
+<2-4 предложения:проблема/запрос, выполненные или предложенные действия, подтвержденный результат при наличии>
 
 ❗️[USER=<creatorId>]Постановщик[/USER], релиз, указанный в задаче, не совпадает с фактическим.
 
@@ -968,23 +1026,15 @@ ${JSON.stringify(contextparentID, null, 2)}
 
 async function processClosedTask(taskId) {
   const { task: mainTask, comments: mainComments } = await fetchTaskWithComments(taskId);
+  const filteredMainComments = filterGemmaComments(mainComments);
   const parentId = getParentIdFromTask(mainTask);
   const responsibleId = getResponsibleIdFromTask(mainTask);
   const creatorId = getCreatorIdFromTask(mainTask);
   const groupId = getGroupIdFromTask(mainTask);
   const groupName = getGroupNameFromTask(mainTask);
   const timeLogs = await fetchTaskTimeLogs(taskId);
+  const timeSpentInLogs = getTaskTimeSpent(mainTask);
   let contextparentID = null;
-
-  if (timeLogs.length === 0) {
-    return {
-      ok: true,
-      skipped: true,
-      reason: 'empty_time_logs',
-      task_id: taskId,
-      time_logs_count: timeLogs.length,
-    };
-  }
 
   if (isCollabGroupName(groupName)) {
     return {
@@ -997,21 +1047,67 @@ async function processClosedTask(taskId) {
     };
   }
 
+  if (isGemmaExcludedGroupId(groupId)) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'excluded_group_id',
+      task_id: taskId,
+      group_id: groupId,
+      group_name: groupName,
+    };
+  }
+
   if (parentId && parentId !== '0') {
     const { task: parentTask, comments: parentComments } = await fetchTaskWithComments(parentId);
-    contextparentID = { parentId, parentTask, parentTaskComments: parentComments };
+    const filteredParentComments = filterGemmaComments(parentComments);
+    const parentTimeLogs = await fetchTaskTimeLogs(parentId);
+    contextparentID = {
+      parentId,
+      parentTask,
+      parentTaskComments: filteredParentComments,
+      parentTaskTime: parentTimeLogs,
+      parentTaskTimeSpentInLogs: getTaskTimeSpent(parentTask),
+    };
   }
 
   const aiResponse = await coworkRequest('POST', '/chat/completions', {
     model: MODEL_NAME,
     messages: [{
       role: 'user',
-      content: buildPrompt({ taskId, responsibleId, creatorId, mainTask, mainComments, contextparentID }),
+      content: buildPrompt({
+        taskId,
+        groupId,
+        responsibleId,
+        creatorId,
+        mainTask,
+        mainComments: filteredMainComments,
+        mainTimeLogs: timeLogs,
+        mainTimeSpentInLogs: timeSpentInLogs,
+        contextparentID,
+      }),
     }],
   });
 
   const aiComment = aiResponse?.choices?.[0]?.message?.content?.trim();
   if (!aiComment) throw new Error('Gemma returned empty comment');
+
+  if (timeSpentInLogs === 0 && isInsufficientInfoComment(aiComment)) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'zero_time_and_insufficient_info',
+      task_id: taskId,
+      parent_id: parentId || null,
+      responsible_id: responsibleId,
+      creator_id: creatorId,
+      group_id: groupId || null,
+      group_name: groupName || null,
+      time_spent_in_logs: timeSpentInLogs,
+      time_logs_count: timeLogs.length,
+      comment_posted: false,
+    };
+  }
 
   await coworkRequest('POST', `/tasks/${taskId}/comments`, {
     message: aiComment,
@@ -1025,6 +1121,7 @@ async function processClosedTask(taskId) {
     creator_id: creatorId,
     group_id: groupId || null,
     group_name: groupName || null,
+    time_spent_in_logs: timeSpentInLogs,
     time_logs_count: timeLogs.length,
     comment_posted: true,
     ai_comment: aiComment,
