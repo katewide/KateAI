@@ -42,6 +42,7 @@ const GEMMA_COMMENT_AUTHOR_ID = String(process.env.GEMMA_COMMENT_AUTHOR_ID || 20
 const AI_IMAGE_PROCESSING_ENABLED = true;
 const AI_MAX_IMAGES = 15;
 const AI_MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const AI_MAX_TOTAL_IMAGE_BYTES = 28 * 1024 * 1024;
 const AI_SUPPORTED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 
 let taskTimeCheckInProgress = false;
@@ -696,13 +697,30 @@ async function prepareTaskImages(task, comments, scope) {
 function buildAiMessageContent(prompt, images) {
   if (!images.length) return prompt;
 
+  let totalImageBytes = 0;
+  const limitedImages = [];
+  for (const image of images) {
+    const base64 = String(image.dataUrl || '').split(',')[1] || '';
+    const imageBytes = Math.ceil(base64.length * 3 / 4);
+    if (totalImageBytes + imageBytes > AI_MAX_TOTAL_IMAGE_BYTES) break;
+    totalImageBytes += imageBytes;
+    limitedImages.push(image);
+  }
+
+  if (!limitedImages.length) return prompt;
+
   return [
     { type: 'text', text: prompt },
-    ...images.map(image => ({
+    ...limitedImages.map(image => ({
       type: 'image_url',
       image_url: { url: image.dataUrl },
     })),
   ];
+}
+
+function truncateDebugText(value, maxLength = 1500) {
+  const text = String(value || '');
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
 async function extractImageFacts(images, scope) {
@@ -1445,6 +1463,8 @@ async function processClosedTask(taskId) {
     ai_images_count: aiImages.length,
     current_image_facts_found: Boolean(mainImageFacts),
     parent_image_facts_found: Boolean(parentImageFacts),
+    current_image_facts_preview: truncateDebugText(mainImageFacts),
+    parent_image_facts_preview: truncateDebugText(parentImageFacts),
   });
   const prompt = buildPrompt({
     taskId,
