@@ -53,6 +53,7 @@ const debugState = {
   nextTaskTimeCheck: null,
   lastTaskTimeChatDecision: null,
   lastTaskTimeCheck: null,
+  lastTaskImages: null,
   lastError: null,
 };
 
@@ -509,12 +510,39 @@ function getKnownFileIds(value) {
     .filter(item => /^\d+$/.test(item));
 }
 
+function extractFileIdsFromText(text) {
+  const value = String(text || '');
+  const ids = [];
+  const patterns = [
+    /\[(?:DISK\s+FILE|FILE)[^\]]*\bID\s*=\s*["']?n?(\d+)["']?[^\]]*\]/gi,
+    /\b(?:fileId|FILE_ID|id)\s*[=:]\s*["']?n?(\d+)["']?/g,
+    /\/(?:disk|files?)\/(?:download|file|showFile|open)\/n?(\d+)/gi,
+  ];
+
+  for (const pattern of patterns) {
+    let match = pattern.exec(value);
+    while (match) {
+      ids.push(match[1]);
+      match = pattern.exec(value);
+    }
+  }
+
+  return [...new Set(ids)];
+}
+
+function extractHttpsUrlsFromText(text) {
+  return [...String(text || '').matchAll(/https:\/\/[^\s"'<>[\]]+/gi)]
+    .map(match => match[0].replace(/[),.;]+$/, ''));
+}
+
 function getAttachmentFields(object) {
   return [
     object?.UF_TASK_WEBDAV_FILES,
     object?.ufTaskWebdavFiles,
     object?.files,
     object?.FILES,
+    object?.attachedFiles,
+    object?.ATTACHED_FILES,
     object?.attachments,
     object?.ATTACHMENTS,
   ];
@@ -555,15 +583,21 @@ function collectImageCandidates(value, source, depth = 0, seen = new Set()) {
 
   if (typeof value === 'string') {
     const trimmed = value.trim();
+    const candidates = [];
+
     if (trimmed.startsWith('data:image/')) {
       return [{ source, name: null, mimeType: normalizeMimeType(trimmed.slice(5, trimmed.indexOf(';'))), dataUrl: trimmed }];
     }
 
-    if (/^https:\/\//i.test(trimmed) && /\.(png|jpe?g|gif|webp)(?:[?#].*)?$/i.test(trimmed)) {
-      return [{ source, name: trimmed.split('/').pop() || null, mimeType: getMimeTypeFromName(trimmed), url: trimmed }];
+    for (const fileId of extractFileIdsFromText(trimmed)) {
+      candidates.push({ source, name: null, mimeType: null, fileId });
     }
 
-    return [];
+    for (const url of extractHttpsUrlsFromText(trimmed)) {
+      candidates.push({ source, name: url.split('/').pop() || null, mimeType: getMimeTypeFromName(url), url });
+    }
+
+    return candidates;
   }
 
   if (Array.isArray(value)) {
@@ -610,7 +644,15 @@ async function downloadImageCandidate(candidate) {
 
   let downloaded = null;
   if (candidate.fileId) {
-    downloaded = await coworkDownload(`/files/${candidate.fileId}/download`);
+    try {
+      downloaded = await coworkDownload(`/files/${candidate.fileId}/download`);
+    } catch (error) {
+      const fileResponse = await bitrixCall('disk.file.get', { id: candidate.fileId });
+      const file = unwrapData(fileResponse);
+      const downloadUrl = file?.DOWNLOAD_URL || file?.downloadUrl || file?.download_url;
+      if (!downloadUrl) throw error;
+      downloaded = await requestBuffer(new URL(downloadUrl), { method: 'GET' });
+    }
   } else if (candidate.url) {
     downloaded = await requestBuffer(new URL(candidate.url), { method: 'GET' });
   }
@@ -648,7 +690,7 @@ async function prepareTaskImages(task, comments, scope) {
     }
   }
 
-  return images;
+  return { candidatesCount: candidates.length, images };
 }
 
 function buildAiMessageContent(prompt, images) {
@@ -1194,8 +1236,8 @@ ${JSON.stringify(context, null, 2)}
 ${JSON.stringify(contextparentID, null, 2)}
 
 Правила анализа:
-- Основной объект анализа - currentTask, currentTaskComments, currentTaskTimeSpentInLogs, currentTaskId.
-- Если контекст родительской задачи не равен null, используй parentTask, parentTaskComments, parentTaskTimeSpentInLogs только как дополнительный контекст.
+- Основной объект анализа - currentTask, currentTaskComments, currentTaskTimeSpentInLogs, currentTaskId, currentTaskImageFacts.
+- Если контекст родительской задачи не равен null, используй parentTask, parentTaskComments, parentTaskTimeSpentInLogs, parentTaskImageFacts только как дополнительный контекст.
 - Если есть несоответствие данных задачи и комментариев, ориентируйся на комментарии.
 - Используй только информацию, содержащуюся в JSON. Ничего не выдумывай и не добавляй от себя.
 - Не добавляй технические детали, если они отсутствуют в исходных данных.
@@ -1370,16 +1412,20 @@ async function processClosedTask(taskId) {
     };
   }
 
-  const mainImages = await prepareTaskImages(mainTask, filteredMainComments, 'currentTask');
+  const mainImageResult = await prepareTaskImages(mainTask, filteredMainComments, 'currentTask');
+  const mainImages = mainImageResult.images;
   const mainImageFacts = await extractImageFacts(mainImages, 'текущей задачи');
   let parentImages = [];
+  let parentImageCandidatesCount = 0;
   let parentImageFacts = null;
 
   if (parentId && parentId !== '0') {
     const { task: parentTask, comments: parentComments } = await fetchTaskWithComments(parentId);
     const filteredParentComments = filterGemmaComments(parentComments);
     const parentTimeLogs = await fetchTaskTimeLogs(parentId);
-    parentImages = await prepareTaskImages(parentTask, filteredParentComments, 'parentTask');
+    const parentImageResult = await prepareTaskImages(parentTask, filteredParentComments, 'parentTask');
+    parentImages = parentImageResult.images;
+    parentImageCandidatesCount = parentImageResult.candidatesCount;
     parentImageFacts = await extractImageFacts(parentImages, 'родительской задачи');
     contextparentID = {
       parentId,
@@ -1393,6 +1439,13 @@ async function processClosedTask(taskId) {
   }
 
   const aiImages = [...mainImages, ...parentImages].slice(0, AI_MAX_IMAGES);
+  saveDebug('lastTaskImages', {
+    task_id: taskId,
+    ai_image_candidates_count: mainImageResult.candidatesCount + parentImageCandidatesCount,
+    ai_images_count: aiImages.length,
+    current_image_facts_found: Boolean(mainImageFacts),
+    parent_image_facts_found: Boolean(parentImageFacts),
+  });
   const prompt = buildPrompt({
     taskId,
     groupId,
