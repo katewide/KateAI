@@ -639,8 +639,9 @@ async function downloadImageCandidate(candidate) {
   if (candidate.dataUrl) {
     if (!isSupportedImageMimeType(candidate.mimeType)) return null;
     const base64 = String(candidate.dataUrl).split(',')[1] || '';
-    if (Math.ceil(base64.length * 3 / 4) > AI_MAX_IMAGE_BYTES) return null;
-    return candidate;
+    const bytes = Math.ceil(base64.length * 3 / 4);
+    if (bytes > AI_MAX_IMAGE_BYTES) return null;
+    return { ...candidate, bytes };
   }
 
   let downloaded = null;
@@ -666,6 +667,7 @@ async function downloadImageCandidate(candidate) {
   return {
     ...candidate,
     mimeType,
+    bytes: downloaded.buffer.length,
     dataUrl: `data:${mimeType};base64,${downloaded.buffer.toString('base64')}`,
   };
 }
@@ -731,10 +733,21 @@ async function extractImageFacts(images, scope) {
       model: MODEL_NAME,
       messages: [{
         role: 'user',
-        content: buildAiMessageContent(`Проанализируй изображения из ${scope} и извлеки только явно видимые факты для задачи 1С.
-Не делай выводы о выполненных работах, если они не видны на изображении.
-Не используй имя файла как источник фактов.
-Верни краткий список фактов: текст ошибок, названия объектов, формы, документы, релизы, видимые результаты проверок.`, images),
+        content: buildAiMessageContent(`Ты анализируешь изображения, приложенные к задачам технической поддержки 1С.
+Твоя задача — извлечь из изображения максимум достоверной информации.
+
+Сначала выполни OCR:
+- перепиши весь читаемый текст максимально дословно;
+- сохрани числа, проценты, названия систем, документов, ошибок, пунктов и подпунктов;
+- не исправляй и не дополняй текст.
+
+Затем сформируй краткое описание изображения в 2–5 предложениях.
+Используй только сведения, которые действительно присутствуют на изображении.
+Не придумывай отсутствующие данные.
+Не объясняй причины.
+Не предлагай решение.
+Не делай выводов, которых нет на изображении.
+Если данные невозможно определить, напиши: Не удалось определить.`, images),
       }],
     });
 
@@ -1228,6 +1241,7 @@ function getImageMetadata(images) {
     name: image.name || null,
     mimeType: image.mimeType || null,
     fileId: image.fileId || null,
+    bytes: image.bytes || null,
   }));
 }
 
@@ -1461,6 +1475,7 @@ async function processClosedTask(taskId) {
     task_id: taskId,
     ai_image_candidates_count: mainImageResult.candidatesCount + parentImageCandidatesCount,
     ai_images_count: aiImages.length,
+    ai_images: getImageMetadata(aiImages),
     current_image_facts_found: Boolean(mainImageFacts),
     parent_image_facts_found: Boolean(parentImageFacts),
     current_image_facts_preview: truncateDebugText(mainImageFacts),
