@@ -23,7 +23,7 @@ function getBitrixRestWebhookUrl() {
 const PORT = process.env.PORT || 3000;
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
-const MODEL_NAME = process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
+const MODEL_NAME = process.env.MODEL_NAME || 'bitrix/bitrixgpt-5.5';
 const BITRIX_REST_WEBHOOK_URL = getBitrixRestWebhookUrl();
 const WEBHOOK_TOKEN = requireEnv('WEBHOOK_TOKEN');
 const ELAPSED_NOTIFICATION_CHAT_ID = process.env.ELAPSED_NOTIFICATION_CHAT_ID || 'chat42358';
@@ -1091,7 +1091,7 @@ async function processClosedTask(taskId) {
   });
 
   const aiComment = aiResponse?.choices?.[0]?.message?.content?.trim();
-  if (!aiComment) throw new Error('Gemma returned empty comment');
+  if (!aiComment) throw new Error('AI model returned empty comment');
 
   if (timeSpentInLogs === 0 && isInsufficientInfoComment(aiComment)) {
     return {
