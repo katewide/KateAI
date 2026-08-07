@@ -39,6 +39,10 @@ const API_REQUEST_TIMEOUT_MS = Number(process.env.API_REQUEST_TIMEOUT_MS || 60 *
 const MSK_UTC_OFFSET_HOURS = 3;
 const GEMMA_EXCLUDED_GROUP_IDS = new Set(['12', '92', '376', '490']);
 const GEMMA_COMMENT_AUTHOR_ID = String(process.env.GEMMA_COMMENT_AUTHOR_ID || 204);
+const AI_IMAGE_PROCESSING_ENABLED = true;
+const AI_MAX_IMAGES = 15;
+const AI_MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const AI_SUPPORTED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 
 let taskTimeCheckInProgress = false;
 let taskTimeCheckStartedAt = null;
@@ -200,6 +204,81 @@ function requestJson(endpoint, options = {}) {
   });
 }
 
+function requestBuffer(endpoint, options = {}, redirectCount = 0) {
+  const client = endpoint.protocol === 'https:' ? https : http;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const req = client.request(endpoint, options, res => {
+      const location = res.headers.location;
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && location && redirectCount < 3) {
+        res.resume();
+        const redirectUrl = new URL(location, endpoint);
+        const redirectOptions = { ...options };
+        if (redirectUrl.origin !== endpoint.origin && redirectOptions.headers?.['X-Api-Key']) {
+          redirectOptions.headers = { ...redirectOptions.headers };
+          delete redirectOptions.headers['X-Api-Key'];
+        }
+        requestBuffer(redirectUrl, redirectOptions, redirectCount + 1).then(resolve, reject);
+        return;
+      }
+
+      const contentLength = Number.parseInt(res.headers['content-length'] || '0', 10);
+      if (Number.isFinite(contentLength) && contentLength > AI_MAX_IMAGE_BYTES) {
+        settled = true;
+        res.resume();
+        reject(new Error(`Image is too large: ${contentLength} bytes`));
+        return;
+      }
+
+      const chunks = [];
+      let total = 0;
+
+      res.on('data', chunk => {
+        if (settled) return;
+        total += chunk.length;
+        if (total > AI_MAX_IMAGE_BYTES) {
+          settled = true;
+          reject(new Error(`Image is too large: ${total} bytes`));
+          req.destroy(new Error(`Image is too large: ${total} bytes`));
+          return;
+        }
+        chunks.push(chunk);
+      });
+
+      res.on('end', () => {
+        if (settled) return;
+        settled = true;
+
+        const buffer = Buffer.concat(chunks);
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(`HTTP ${res.statusCode} from ${endpoint.pathname}: ${buffer.toString('utf8')}`));
+          return;
+        }
+
+        resolve({
+          buffer,
+          contentType: String(res.headers['content-type'] || '').split(';')[0].trim().toLowerCase(),
+        });
+      });
+    });
+
+    req.setTimeout(API_REQUEST_TIMEOUT_MS, () => {
+      if (settled) return;
+      settled = true;
+      req.destroy(new Error(`Request timeout from ${endpoint.pathname}`));
+    });
+
+    req.on('error', error => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+}
+
 function bitrixCall(method, params = {}) {
   const endpoint = new URL(`${method}.json`, BITRIX_REST_WEBHOOK_URL);
   const body = new URLSearchParams();
@@ -220,6 +299,13 @@ function coworkRequest(method, path, body) {
       'X-Api-Key': API_KEY,
     },
     body: body ? JSON.stringify(body) : undefined,
+  });
+}
+
+function coworkDownload(path) {
+  return requestBuffer(new URL(`/v1${path}`, BASE_URL), {
+    method: 'GET',
+    headers: { 'X-Api-Key': API_KEY },
   });
 }
 
@@ -383,6 +469,220 @@ function isGemmaComment(comment) {
 
 function filterGemmaComments(comments) {
   return comments.filter(comment => !isGemmaComment(comment));
+}
+
+function normalizeMimeType(value) {
+  return String(value || '').split(';')[0].trim().toLowerCase();
+}
+
+function getMimeTypeFromName(name) {
+  const lowerName = String(name || '').toLowerCase();
+  if (lowerName.endsWith('.png')) return 'image/png';
+  if (lowerName.endsWith('.jpg') || lowerName.endsWith('.jpeg')) return 'image/jpeg';
+  if (lowerName.endsWith('.gif')) return 'image/gif';
+  if (lowerName.endsWith('.webp')) return 'image/webp';
+  return null;
+}
+
+function isSupportedImageMimeType(mimeType) {
+  return AI_SUPPORTED_IMAGE_MIME_TYPES.has(normalizeMimeType(mimeType));
+}
+
+function getKnownFileIds(value) {
+  if (!value) return [];
+
+  const rawItems = Array.isArray(value)
+    ? value
+    : typeof value === 'object'
+      ? Object.values(value)
+      : [value];
+
+  return rawItems
+    .map(item => {
+      if (typeof item === 'object' && item) {
+        return item.fileId ?? item.FILE_ID ?? item.id ?? item.ID ?? item.objectId ?? item.OBJECT_ID;
+      }
+
+      return item;
+    })
+    .map(item => String(item || '').replace(/^n/i, ''))
+    .filter(item => /^\d+$/.test(item));
+}
+
+function getAttachmentFields(object) {
+  return [
+    object?.UF_TASK_WEBDAV_FILES,
+    object?.ufTaskWebdavFiles,
+    object?.files,
+    object?.FILES,
+    object?.attachments,
+    object?.ATTACHMENTS,
+  ];
+}
+
+function getObjectImageCandidate(object, source) {
+  if (!object || typeof object !== 'object') return null;
+
+  const name = object.name || object.NAME || object.fileName || object.FILENAME || object.title || object.TITLE;
+  const mimeType = normalizeMimeType(
+    object.mimeType ||
+    object.MIME_TYPE ||
+    object.contentType ||
+    object.CONTENT_TYPE ||
+    object.type ||
+    object.TYPE ||
+    getMimeTypeFromName(name)
+  );
+  const url = object.downloadUrl || object.downloadURL || object.DOWNLOAD_URL || object.url || object.URL || object.link || object.LINK;
+  const dataUrl = typeof url === 'string' && url.startsWith('data:image/') ? url : null;
+
+  if (!dataUrl && !isSupportedImageMimeType(mimeType) && !getMimeTypeFromName(name)) {
+    return null;
+  }
+
+  return {
+    source,
+    name: name || null,
+    mimeType: mimeType || getMimeTypeFromName(name),
+    url: typeof url === 'string' ? url : null,
+    dataUrl,
+    fileId: getKnownFileIds(object)[0] || null,
+  };
+}
+
+function collectImageCandidates(value, source, depth = 0, seen = new Set()) {
+  if (!AI_IMAGE_PROCESSING_ENABLED || depth > 5 || value == null) return [];
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed.startsWith('data:image/')) {
+      return [{ source, name: null, mimeType: normalizeMimeType(trimmed.slice(5, trimmed.indexOf(';'))), dataUrl: trimmed }];
+    }
+
+    if (/^https:\/\//i.test(trimmed) && /\.(png|jpe?g|gif|webp)(?:[?#].*)?$/i.test(trimmed)) {
+      return [{ source, name: trimmed.split('/').pop() || null, mimeType: getMimeTypeFromName(trimmed), url: trimmed }];
+    }
+
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value.flatMap((item, index) => collectImageCandidates(item, `${source}[${index}]`, depth + 1, seen));
+  }
+
+  if (typeof value !== 'object' || seen.has(value)) return [];
+  seen.add(value);
+
+  const candidates = [];
+  const objectCandidate = getObjectImageCandidate(value, source);
+  if (objectCandidate) candidates.push(objectCandidate);
+
+  for (const attachmentField of getAttachmentFields(value)) {
+    for (const fileId of getKnownFileIds(attachmentField)) {
+      candidates.push({ source, name: null, mimeType: null, fileId });
+    }
+  }
+
+  for (const [key, item] of Object.entries(value)) {
+    candidates.push(...collectImageCandidates(item, `${source}.${key}`, depth + 1, seen));
+  }
+
+  return candidates;
+}
+
+function dedupeImageCandidates(candidates) {
+  const seen = new Set();
+  return candidates.filter(candidate => {
+    const key = candidate.dataUrl || candidate.url || candidate.fileId;
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function downloadImageCandidate(candidate) {
+  if (candidate.dataUrl) {
+    if (!isSupportedImageMimeType(candidate.mimeType)) return null;
+    const base64 = String(candidate.dataUrl).split(',')[1] || '';
+    if (Math.ceil(base64.length * 3 / 4) > AI_MAX_IMAGE_BYTES) return null;
+    return candidate;
+  }
+
+  let downloaded = null;
+  if (candidate.fileId) {
+    downloaded = await coworkDownload(`/files/${candidate.fileId}/download`);
+  } else if (candidate.url) {
+    downloaded = await requestBuffer(new URL(candidate.url), { method: 'GET' });
+  }
+
+  if (!downloaded?.buffer?.length) return null;
+
+  const mimeType = normalizeMimeType(downloaded.contentType || candidate.mimeType || getMimeTypeFromName(candidate.name));
+  if (!isSupportedImageMimeType(mimeType)) return null;
+
+  return {
+    ...candidate,
+    mimeType,
+    dataUrl: `data:${mimeType};base64,${downloaded.buffer.toString('base64')}`,
+  };
+}
+
+async function prepareTaskImages(task, comments, scope) {
+  const candidates = dedupeImageCandidates([
+    ...collectImageCandidates(task, `${scope}.task`),
+    ...comments.flatMap(comment => collectImageCandidates(comment, `${scope}.comment:${comment?.id || comment?.ID || 'unknown'}`)),
+  ]).slice(0, AI_MAX_IMAGES);
+
+  const images = [];
+  for (const candidate of candidates) {
+    try {
+      const image = await downloadImageCandidate(candidate);
+      if (image?.dataUrl) images.push(image);
+    } catch (error) {
+      log('Image skipped', {
+        source: candidate.source,
+        file_id: candidate.fileId || null,
+        url: candidate.url || null,
+        error: error.message,
+      });
+    }
+  }
+
+  return images;
+}
+
+function buildAiMessageContent(prompt, images) {
+  if (!images.length) return prompt;
+
+  return [
+    { type: 'text', text: prompt },
+    ...images.map(image => ({
+      type: 'image_url',
+      image_url: { url: image.dataUrl },
+    })),
+  ];
+}
+
+async function extractImageFacts(images, scope) {
+  if (!images.length) return null;
+
+  try {
+    const response = await coworkRequest('POST', '/chat/completions', {
+      model: MODEL_NAME,
+      messages: [{
+        role: 'user',
+        content: buildAiMessageContent(`Проанализируй изображения из ${scope} и извлеки только явно видимые факты для задачи 1С.
+Не делай выводы о выполненных работах, если они не видны на изображении.
+Не используй имя файла как источник фактов.
+Верни краткий список фактов: текст ошибок, названия объектов, формы, документы, релизы, видимые результаты проверок.`, images),
+      }],
+    });
+
+    return response?.choices?.[0]?.message?.content?.trim() || null;
+  } catch (error) {
+    log('Image facts extraction failed', { scope, error: error.message });
+    return null;
+  }
 }
 
 function normalizeTimePayload(response) {
@@ -862,7 +1162,16 @@ function isInsufficientInfoComment(comment) {
   return String(comment || '').includes('Недостаточно информации');
 }
 
-function buildPrompt({ taskId, groupId, responsibleId, creatorId, mainTask, mainComments, mainTimeLogs, mainTimeSpentInLogs, contextparentID }) {
+function getImageMetadata(images) {
+  return images.map(image => ({
+    source: image.source,
+    name: image.name || null,
+    mimeType: image.mimeType || null,
+    fileId: image.fileId || null,
+  }));
+}
+
+function buildPrompt({ taskId, groupId, responsibleId, creatorId, mainTask, mainComments, mainTimeLogs, mainTimeSpentInLogs, mainImages, mainImageFacts, contextparentID }) {
   const context = {
     currentTaskId: taskId,
     groupId,
@@ -872,6 +1181,8 @@ function buildPrompt({ taskId, groupId, responsibleId, creatorId, mainTask, main
     currentTaskComments: mainComments,
     currentTaskTime: mainTimeLogs,
     currentTaskTimeSpentInLogs: mainTimeSpentInLogs,
+    currentTaskImages: getImageMetadata(mainImages),
+    currentTaskImageFacts: mainImageFacts,
   };
 
   return `Ты - профессиональный консультант 1С. Твоя задача - проанализировать данные задачи и написать краткий итог. Ты анализируешь задачи компании-франчайзи 1С. Используй профессиональную терминологию, принятую в сфере внедрения и сопровождения продуктов 1С.
@@ -1059,34 +1370,48 @@ async function processClosedTask(taskId) {
     };
   }
 
+  const mainImages = await prepareTaskImages(mainTask, filteredMainComments, 'currentTask');
+  const mainImageFacts = await extractImageFacts(mainImages, 'текущей задачи');
+  let parentImages = [];
+  let parentImageFacts = null;
+
   if (parentId && parentId !== '0') {
     const { task: parentTask, comments: parentComments } = await fetchTaskWithComments(parentId);
     const filteredParentComments = filterGemmaComments(parentComments);
     const parentTimeLogs = await fetchTaskTimeLogs(parentId);
+    parentImages = await prepareTaskImages(parentTask, filteredParentComments, 'parentTask');
+    parentImageFacts = await extractImageFacts(parentImages, 'родительской задачи');
     contextparentID = {
       parentId,
       parentTask,
       parentTaskComments: filteredParentComments,
       parentTaskTime: parentTimeLogs,
       parentTaskTimeSpentInLogs: getTaskTimeSpent(parentTask),
+      parentTaskImages: getImageMetadata(parentImages),
+      parentTaskImageFacts: parentImageFacts,
     };
   }
+
+  const aiImages = [...mainImages, ...parentImages].slice(0, AI_MAX_IMAGES);
+  const prompt = buildPrompt({
+    taskId,
+    groupId,
+    responsibleId,
+    creatorId,
+    mainTask,
+    mainComments: filteredMainComments,
+    mainTimeLogs: timeLogs,
+    mainTimeSpentInLogs: timeSpentInLogs,
+    mainImages,
+    mainImageFacts,
+    contextparentID,
+  });
 
   const aiResponse = await coworkRequest('POST', '/chat/completions', {
     model: MODEL_NAME,
     messages: [{
       role: 'user',
-      content: buildPrompt({
-        taskId,
-        groupId,
-        responsibleId,
-        creatorId,
-        mainTask,
-        mainComments: filteredMainComments,
-        mainTimeLogs: timeLogs,
-        mainTimeSpentInLogs: timeSpentInLogs,
-        contextparentID,
-      }),
+      content: prompt,
     }],
   });
 
@@ -1106,6 +1431,9 @@ async function processClosedTask(taskId) {
       group_name: groupName || null,
       time_spent_in_logs: timeSpentInLogs,
       time_logs_count: timeLogs.length,
+      ai_images_count: aiImages.length,
+      current_image_facts_found: Boolean(mainImageFacts),
+      parent_image_facts_found: Boolean(parentImageFacts),
       comment_posted: false,
     };
   }
@@ -1124,6 +1452,9 @@ async function processClosedTask(taskId) {
     group_name: groupName || null,
     time_spent_in_logs: timeSpentInLogs,
     time_logs_count: timeLogs.length,
+    ai_images_count: aiImages.length,
+    current_image_facts_found: Boolean(mainImageFacts),
+    parent_image_facts_found: Boolean(parentImageFacts),
     comment_posted: true,
     ai_comment: aiComment,
   };
