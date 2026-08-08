@@ -96,6 +96,26 @@ function getSafeHeaders(headers) {
   return safeHeaders;
 }
 
+function stringifyForLog(value) {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function getErrorMessage(value, fallback = 'Unknown error') {
+  if (!value) return fallback;
+  if (typeof value === 'string') return value;
+  if (value instanceof Error) return value.message;
+  if (typeof value.message === 'string') return value.message;
+  if (typeof value.error_description === 'string') return value.error_description;
+  if (typeof value.error === 'string') return value.error;
+  if (typeof value.code === 'string') return value.code;
+  return stringifyForLog(value);
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -169,12 +189,12 @@ function requestJson(endpoint, options = {}) {
         }
 
         if (json?.error) {
-          reject(new Error(json.error_description || json.error));
+          reject(new Error(getErrorMessage(json.error_description || json.error)));
           return;
         }
 
         if (json?.success === false) {
-          reject(new Error(json.error?.message || json.error?.code || 'API returned success=false'));
+          reject(new Error(getErrorMessage(json.error, 'API returned success=false')));
           return;
         }
 
@@ -1049,7 +1069,7 @@ async function extractImageFacts(images, scope) {
       }],
     });
 
-    return response?.choices?.[0]?.message?.content?.trim() || null;
+    return normalizeAiContent(response?.choices?.[0]?.message?.content) || null;
   } catch (error) {
     log('Image facts extraction failed', { scope, error: error.message });
     return null;
@@ -1569,6 +1589,25 @@ function isSummaryOnlyGroup(groupId) {
   return String(groupId || '') === '276';
 }
 
+function normalizeAiContent(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .map(item => {
+        if (typeof item === 'string') return item;
+        if (typeof item?.text === 'string') return item.text;
+        if (typeof item?.content === 'string') return item.content;
+        return stringifyForLog(item);
+      })
+      .join('\n')
+      .trim();
+  }
+  if (typeof content.text === 'string') return content.text.trim();
+  if (typeof content.content === 'string') return content.content.trim();
+  return stringifyForLog(content).trim();
+}
+
 function extractTitleFromAiComment(comment) {
   const text = String(comment || '');
   const titleMatch = text.match(/\[b\]📝 TITLE:\[\/b\]\s*([\s\S]*)$/i);
@@ -1889,7 +1928,7 @@ async function processClosedTask(taskId, options = {}) {
     }],
   });
 
-  const aiComment = aiResponse?.choices?.[0]?.message?.content?.trim();
+  const aiComment = normalizeAiContent(aiResponse?.choices?.[0]?.message?.content);
   if (!aiComment && timeSpentInLogs === 0) {
     return {
       ok: true,
@@ -2124,6 +2163,16 @@ function sendAiTestPage(res) {
     </section>
   </main>
   <script>
+    function renderValue(value) {
+      if (value === null || value === undefined) return '';
+      if (typeof value === 'string') return value;
+      try {
+        return JSON.stringify(value, null, 2);
+      } catch {
+        return String(value);
+      }
+    }
+
     const form = document.getElementById('form');
     const run = document.getElementById('run');
     const status = document.getElementById('status');
@@ -2143,10 +2192,10 @@ function sendAiTestPage(res) {
         const taskId = document.getElementById('taskId').value.trim();
         const response = await fetch('/ai-preview?taskId=' + encodeURIComponent(taskId));
         const data = await response.json();
-        if (!response.ok || !data.ok) throw new Error(data.error || 'Ошибка запроса');
+        if (!response.ok || !data.ok) throw new Error(renderValue(data.error || data));
 
-        final.textContent = data.ai_comment || '';
-        raw.textContent = data.raw_ai_comment || '';
+        final.textContent = renderValue(data.ai_comment);
+        raw.textContent = renderValue(data.raw_ai_comment);
         details.textContent = JSON.stringify({
           task_id: data.task_id,
           group_id: data.group_id,
@@ -2163,7 +2212,7 @@ function sendAiTestPage(res) {
         status.textContent = 'Готово';
       } catch (error) {
         status.textContent = 'Ошибка';
-        final.textContent = error.message;
+        final.textContent = renderValue(error.message || error);
         final.className = 'error';
       } finally {
         run.disabled = false;
