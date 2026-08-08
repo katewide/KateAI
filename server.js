@@ -11,7 +11,8 @@ function requireEnv(name) {
 const PORT = process.env.PORT || 3000;
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
-const MODEL_NAME = process.env.MODEL_NAME || 'bitrix/bitrixgpt-5.5';
+const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
+const IMAGE_MODEL_NAME = process.env.IMAGE_MODEL_NAME || 'bitrix/bitrixgpt-5.5';
 const WEBHOOK_TOKEN = requireEnv('WEBHOOK_TOKEN');
 const ELAPSED_NOTIFICATION_CHAT_ID = process.env.ELAPSED_NOTIFICATION_CHAT_ID || 'chat42358';
 const BITRIX_PORTAL_URL = process.env.BITRIX_PORTAL_URL || 'https://elros.bitrix24.ru';
@@ -1022,15 +1023,29 @@ async function extractImageFacts(images, scope) {
 
   try {
     const response = await coworkRequest('POST', '/chat/completions', {
-      model: MODEL_NAME,
+      model: IMAGE_MODEL_NAME,
       messages: [{
         role: 'user',
-        content: buildAiMessageContent(`Выполни OCR изображения, приложенного к задаче технической поддержки 1С.
+        content: buildAiMessageContent(`Ты анализируешь изображения, приложенные к задачам технической поддержки 1С.
+Твоя задача — извлечь из изображения максимум достоверной информации для дальнейшего анализа задачи.
+
+Сначала выполни полный OCR:
 - перепиши весь читаемый текст максимально дословно;
-- сохрани числа, проценты, названия систем, документов, ошибок, пунктов и подпунктов;
+- сохрани числа, проценты, даты, номера документов, названия систем, документов, форм, ошибок, пунктов и подпунктов;
+- сохрани названия объектов 1С, методов, областей макета, реквизитов, отчетов, обработок, регистров и настроек;
 - не исправляй и не дополняй текст.
-Не придумывай отсутствующие данные.
-Если читаемый текст отсутствует или его невозможно определить, напиши: Не удалось определить.`, images),
+
+Затем перечисли все подтвержденные факты, которые видны на изображении:
+- тексты ошибок и предупреждений;
+- названия объектов, документов, форм, отчетов, обработок и настроек;
+- даты, номера, суммы, статусы и пользователей;
+- видимые результаты проверок или выполнения действий.
+
+Используй только сведения, которые действительно присутствуют на изображении.
+Не объясняй причины.
+Не предлагай решение.
+Не делай выводов, которых нет на изображении.
+Если читаемый текст и факты невозможно определить, напиши: Не удалось определить.`, images),
       }],
     });
 
@@ -1831,6 +1846,8 @@ async function processClosedTask(taskId, options = {}) {
   saveDebug('lastTaskImages', {
     task_id: taskId,
     comments_source: commentsSource,
+    image_model: IMAGE_MODEL_NAME,
+    summary_model: SUMMARY_MODEL_NAME,
     ai_image_candidates_count: mainImageResult.candidatesCount + mainChatImageResult.candidatesCount + parentImageCandidatesCount,
     current_image_candidates: [...mainImageResult.candidates, ...mainChatImageResult.candidates],
     parent_image_candidates: parentImageCandidates,
@@ -1865,7 +1882,7 @@ async function processClosedTask(taskId, options = {}) {
   });
 
   const aiResponse = await coworkRequest('POST', '/chat/completions', {
-    model: MODEL_NAME,
+    model: SUMMARY_MODEL_NAME,
     messages: [{
       role: 'user',
       content: prompt,
@@ -1884,6 +1901,8 @@ async function processClosedTask(taskId, options = {}) {
       creator_id: creatorId,
       group_id: groupId || null,
       group_name: groupName || null,
+      image_model: IMAGE_MODEL_NAME,
+      summary_model: SUMMARY_MODEL_NAME,
       time_spent_in_logs: timeSpentInLogs,
       time_logs_count: timeLogs.length,
       ai_images_count: aiImages.length,
@@ -1912,6 +1931,8 @@ async function processClosedTask(taskId, options = {}) {
         creator_id: creatorId,
         group_id: groupId || null,
         group_name: groupName || null,
+        image_model: IMAGE_MODEL_NAME,
+        summary_model: SUMMARY_MODEL_NAME,
         time_spent_in_logs: timeSpentInLogs,
         time_logs_count: timeLogs.length,
         ai_images_count: aiImages.length,
@@ -1938,6 +1959,8 @@ async function processClosedTask(taskId, options = {}) {
       creator_id: creatorId,
       group_id: groupId || null,
       group_name: groupName || null,
+      image_model: IMAGE_MODEL_NAME,
+      summary_model: SUMMARY_MODEL_NAME,
       time_spent_in_logs: timeSpentInLogs,
       time_logs_count: timeLogs.length,
       ai_images_count: aiImages.length,
@@ -1975,6 +1998,8 @@ async function processClosedTask(taskId, options = {}) {
     creator_id: creatorId,
     group_id: groupId || null,
     group_name: groupName || null,
+    image_model: IMAGE_MODEL_NAME,
+    summary_model: SUMMARY_MODEL_NAME,
     time_spent_in_logs: timeSpentInLogs,
     time_logs_count: timeLogs.length,
     ai_images_count: aiImages.length,
@@ -2125,6 +2150,8 @@ function sendAiTestPage(res) {
         details.textContent = JSON.stringify({
           task_id: data.task_id,
           group_id: data.group_id,
+          image_model: data.image_model,
+          summary_model: data.summary_model,
           time_spent_in_logs: data.time_spent_in_logs,
           comment_would_be_posted: data.comment_would_be_posted,
           summary_field: data.summary_field,
