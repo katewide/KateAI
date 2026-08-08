@@ -1586,12 +1586,20 @@ async function updateTaskSummaryField(taskId, value) {
     await coworkRequest('PATCH', `/tasks/${taskId}`, {
       [TASK_SUMMARY_FIELD_CODE]: value,
     });
-    return TASK_SUMMARY_FIELD_CODE;
-  } catch (error) {
-    await coworkRequest('PATCH', `/tasks/${taskId}`, {
-      [TASK_SUMMARY_FIELD_FALLBACK_CODE]: value,
-    });
-    return TASK_SUMMARY_FIELD_FALLBACK_CODE;
+    return { updated: true, field: TASK_SUMMARY_FIELD_CODE, error: null };
+  } catch (firstError) {
+    try {
+      await coworkRequest('PATCH', `/tasks/${taskId}`, {
+        [TASK_SUMMARY_FIELD_FALLBACK_CODE]: value,
+      });
+      return { updated: true, field: TASK_SUMMARY_FIELD_FALLBACK_CODE, error: null };
+    } catch (secondError) {
+      return {
+        updated: false,
+        field: TASK_SUMMARY_FIELD_CODE,
+        error: `${firstError.message}; fallback ${TASK_SUMMARY_FIELD_FALLBACK_CODE}: ${secondError.message}`,
+      };
+    }
   }
 }
 
@@ -1912,10 +1920,13 @@ async function processClosedTask(taskId) {
   const generatedTitle = extractTitleFromAiComment(aiComment);
   let summaryFieldUpdated = false;
   let summaryFieldCode = TASK_SUMMARY_FIELD_CODE;
+  let summaryFieldError = null;
 
   if (generatedTitle) {
-    summaryFieldCode = await updateTaskSummaryField(taskId, generatedTitle);
-    summaryFieldUpdated = true;
+    const summaryFieldResult = await updateTaskSummaryField(taskId, generatedTitle);
+    summaryFieldCode = summaryFieldResult.field;
+    summaryFieldUpdated = summaryFieldResult.updated;
+    summaryFieldError = summaryFieldResult.error;
   }
 
   return {
@@ -1934,6 +1945,7 @@ async function processClosedTask(taskId) {
     comment_posted: true,
     summary_field: summaryFieldCode,
     summary_field_updated: summaryFieldUpdated,
+    summary_field_error: summaryFieldError,
     generated_title: generatedTitle,
     ai_comment: aiComment,
   };
