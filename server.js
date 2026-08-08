@@ -473,6 +473,27 @@ function normalizeChatFilesPayload(response) {
   return Array.isArray(files) ? files : [];
 }
 
+function isDeletedChatMessage(message) {
+  return message?.params?.isDeleted === 'Y' || message?.PARAMS?.IS_DELETED === 'Y';
+}
+
+function isUserChatMessage(message) {
+  return !message?.isSystem && String(message?.authorId || message?.AUTHOR_ID || '') !== '0' && !isDeletedChatMessage(message);
+}
+
+function normalizeChatComment(message, taskId) {
+  return {
+    id: message?.id || message?.ID || null,
+    taskId,
+    chatId: message?.chatId || message?.CHAT_ID || null,
+    authorId: message?.authorId || message?.AUTHOR_ID || null,
+    message: message?.text || message?.TEXT || '',
+    createdAt: message?.date || message?.createdAt || message?.DATE_CREATE || null,
+    params: message?.params || message?.PARAMS || {},
+    source: 'chat',
+  };
+}
+
 async function fetchTaskChatMessages(task) {
   const chatId = getTaskChatId(task);
   if (!chatId) return { chatId: null, messages: [], files: [] };
@@ -884,20 +905,26 @@ function normalizeTimePayload(response) {
 }
 
 async function fetchTaskWithComments(taskId) {
-  const [taskResult, commentsResult] = await Promise.allSettled([
-    coworkRequest('GET', `/tasks/${taskId}`),
+  const taskResult = await coworkRequest('GET', `/tasks/${taskId}`);
+  const task = normalizeTaskPayload(taskResult);
+  const [commentsResult, chatResult] = await Promise.allSettled([
     coworkRequest('GET', `/tasks/${taskId}/comments`),
+    fetchTaskChatMessages(task),
   ]);
 
-  if (taskResult.status === 'rejected') {
-    throw new Error(`Failed to fetch task ${taskId}: ${taskResult.reason.message}`);
-  }
+  const fallbackComments = commentsResult.status === 'fulfilled'
+    ? normalizeCommentsPayload(commentsResult.value)
+    : [];
+  const chatComments = chatResult.status === 'fulfilled'
+    ? chatResult.value.messages
+      .filter(isUserChatMessage)
+      .map(message => normalizeChatComment(message, taskId))
+    : [];
 
   return {
-    task: normalizeTaskPayload(taskResult.value),
-    comments: commentsResult.status === 'fulfilled'
-      ? normalizeCommentsPayload(commentsResult.value)
-      : [],
+    task,
+    comments: chatComments.length > 0 ? chatComments : fallbackComments,
+    commentsSource: chatComments.length > 0 ? 'chat' : 'task_comments',
   };
 }
 
@@ -1531,7 +1558,7 @@ ${JSON.stringify(contextparentID, null, 2)}
 }
 
 async function processClosedTask(taskId) {
-  const { task: mainTask, comments: mainComments } = await fetchTaskWithComments(taskId);
+  const { task: mainTask, comments: mainComments, commentsSource } = await fetchTaskWithComments(taskId);
   const filteredMainComments = filterGemmaComments(mainComments);
   const parentId = getParentIdFromTask(mainTask);
   const responsibleId = getResponsibleIdFromTask(mainTask);
@@ -1574,7 +1601,7 @@ async function processClosedTask(taskId) {
   let parentImageFacts = null;
 
   if (parentId && parentId !== '0') {
-    const { task: parentTask, comments: parentComments } = await fetchTaskWithComments(parentId);
+    const { task: parentTask, comments: parentComments, commentsSource: parentCommentsSource } = await fetchTaskWithComments(parentId);
     const filteredParentComments = filterGemmaComments(parentComments);
     const parentTimeLogs = await fetchTaskTimeLogs(parentId);
     const parentImageResult = await prepareTaskImages(parentTask, filteredParentComments, 'parentTask');
@@ -1591,12 +1618,14 @@ async function processClosedTask(taskId) {
       parentTaskTimeSpentInLogs: getTaskTimeSpent(parentTask),
       parentTaskImages: getImageMetadata(parentImages),
       parentTaskImageFacts: parentImageFacts,
+      parentTaskCommentsSource: parentCommentsSource,
     };
   }
 
   const aiImages = [...mainImages, ...parentImages].slice(0, AI_MAX_IMAGES);
   saveDebug('lastTaskImages', {
     task_id: taskId,
+    comments_source: commentsSource,
     ai_image_candidates_count: mainImageResult.candidatesCount + mainChatImageResult.candidatesCount + parentImageCandidatesCount,
     current_image_candidates: [...mainImageResult.candidates, ...mainChatImageResult.candidates],
     parent_image_candidates: parentImageCandidates,
