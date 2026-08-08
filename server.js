@@ -47,6 +47,8 @@ const AI_SUPPORTED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image
 const AUDIO_TRANSCRIPTION_MODEL = 'bitrix/deepdml/faster-whisper-large-v3-turbo-ct2';
 const AI_MAX_AUDIO_FILES = 10;
 const AI_MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+const TASK_SUMMARY_FIELD_CODE = 'UF_AUTO_669590144190';
+const TASK_SUMMARY_FIELD_FALLBACK_CODE = 'ufAuto669590144190';
 
 let taskTimeCheckInProgress = false;
 let taskTimeCheckStartedAt = null;
@@ -1565,6 +1567,34 @@ function isInsufficientInfoComment(comment) {
   return String(comment || '').includes('Недостаточно информации');
 }
 
+function extractTitleFromAiComment(comment) {
+  const text = String(comment || '');
+  const titleMatch = text.match(/\[b\]📝 TITLE:\[\/b\]\s*([\s\S]*)$/i);
+  if (!titleMatch) return null;
+
+  return titleMatch[1]
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => line.replace(/^\d+\.\s*/, '').trim())
+    .join('\n')
+    .trim() || null;
+}
+
+async function updateTaskSummaryField(taskId, value) {
+  try {
+    await coworkRequest('PATCH', `/tasks/${taskId}`, {
+      [TASK_SUMMARY_FIELD_CODE]: value,
+    });
+    return TASK_SUMMARY_FIELD_CODE;
+  } catch (error) {
+    await coworkRequest('PATCH', `/tasks/${taskId}`, {
+      [TASK_SUMMARY_FIELD_FALLBACK_CODE]: value,
+    });
+    return TASK_SUMMARY_FIELD_FALLBACK_CODE;
+  }
+}
+
 function getImageMetadata(images) {
   return images.map(image => ({
     source: image.source,
@@ -1879,6 +1909,14 @@ async function processClosedTask(taskId) {
   await coworkRequest('POST', `/tasks/${taskId}/comments`, {
     message: aiComment,
   });
+  const generatedTitle = extractTitleFromAiComment(aiComment);
+  let summaryFieldUpdated = false;
+  let summaryFieldCode = TASK_SUMMARY_FIELD_CODE;
+
+  if (generatedTitle) {
+    summaryFieldCode = await updateTaskSummaryField(taskId, generatedTitle);
+    summaryFieldUpdated = true;
+  }
 
   return {
     ok: true,
@@ -1894,6 +1932,9 @@ async function processClosedTask(taskId) {
     current_image_facts_found: Boolean(mainImageFacts),
     parent_image_facts_found: Boolean(parentImageFacts),
     comment_posted: true,
+    summary_field: summaryFieldCode,
+    summary_field_updated: summaryFieldUpdated,
+    generated_title: generatedTitle,
     ai_comment: aiComment,
   };
 }
