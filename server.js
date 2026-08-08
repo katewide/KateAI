@@ -1685,8 +1685,10 @@ ${JSON.stringify(contextparentID, null, 2)}
 
 Проверка времени в задаче:
 1. Используй значение currentTaskTimeSpentInLogs как фактическое время по текущей задаче.
-2. Если currentTaskTimeSpentInLogs равно 0 и из JSON задачи и базовой задачи невозможно определить, в чем заключалась проблема или какие действия были выполнены, не выводи разделы ✅ SUMMARY и 📝 TITLE. В этом случае ничего не выводи, сообщение не пиши.
-3. Если currentTaskTimeSpentInLogs больше 0 и из JSON задачи и базовой задачи невозможно определить, в чем заключалась проблема или какие действия были выполнены, обработай задачу по правилу "Проверка достаточности информации".
+2. Не используй currentTaskTimeSpentInLogs для оценки достаточности информации. Достаточность информации определяй только по JSON задачи, базовой задачи, комментариям, изображениям и расшифровкам аудио.
+3. Если информации достаточно, обработай задачу по применимым правилам этого промпта независимо от того, равно currentTaskTimeSpentInLogs 0 или больше 0.
+4. Если currentTaskTimeSpentInLogs равно 0 и из JSON задачи и базовой задачи невозможно определить, в чем заключалась проблема или какие действия были выполнены, не выводи разделы ✅ SUMMARY и 📝 TITLE. В этом случае ничего не выводи, сообщение не пиши.
+5. Если currentTaskTimeSpentInLogs больше 0 и из JSON задачи и базовой задачи невозможно определить, в чем заключалась проблема или какие действия были выполнены, обработай задачу по правилу "Проверка достаточности информации".
 - Не используй currentTaskTimeSpentInLogs как источник описания проблемы или выполненных работ.
 
 Упоминание исполнителя:
@@ -1851,6 +1853,25 @@ async function processClosedTask(taskId) {
   });
 
   const aiComment = aiResponse?.choices?.[0]?.message?.content?.trim();
+  if (!aiComment && timeSpentInLogs === 0) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'zero_time_and_empty_ai_comment',
+      task_id: taskId,
+      parent_id: parentId || null,
+      responsible_id: responsibleId,
+      creator_id: creatorId,
+      group_id: groupId || null,
+      group_name: groupName || null,
+      time_spent_in_logs: timeSpentInLogs,
+      time_logs_count: timeLogs.length,
+      ai_images_count: aiImages.length,
+      current_image_facts_found: Boolean(mainImageFacts),
+      parent_image_facts_found: Boolean(parentImageFacts),
+      comment_posted: false,
+    };
+  }
   if (!aiComment) throw new Error('AI model returned empty comment');
 
   if (timeSpentInLogs === 0 && isInsufficientInfoComment(aiComment)) {
