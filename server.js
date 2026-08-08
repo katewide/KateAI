@@ -1033,7 +1033,8 @@ async function extractImageFacts(images, scope) {
 - сохрани числа, проценты, названия систем, документов, ошибок, пунктов и подпунктов;
 - не исправляй и не дополняй текст.
 
-Затем сформируй краткое описание изображения в 2–5 предложениях.
+Затем сформируй полное описание изображения.
+Включи все существенные видимые сведения: тексты ошибок, названия объектов, документов, форм, пользователей, организаций, даты, номера, суммы, статусы, настройки и результаты проверок.
 Используй только сведения, которые действительно присутствуют на изображении.
 Не придумывай отсутствующие данные.
 Не объясняй причины.
@@ -1815,6 +1816,8 @@ async function processClosedTask(taskId) {
     ai_images: getImageMetadata(aiImages),
     current_image_facts_found: Boolean(mainImageFacts),
     parent_image_facts_found: Boolean(parentImageFacts),
+    current_image_facts: mainImageFacts || '',
+    parent_image_facts: parentImageFacts || '',
     current_image_facts_preview: truncateDebugText(mainImageFacts),
     parent_image_facts_preview: truncateDebugText(parentImageFacts),
     current_audio_candidates_count: mainAudioResult.candidatesCount,
