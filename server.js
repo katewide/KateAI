@@ -1922,12 +1922,13 @@ async function processClosedTask(taskId) {
   let summaryFieldCode = TASK_SUMMARY_FIELD_CODE;
   let summaryFieldError = null;
 
-  if (generatedTitle) {
-    const summaryFieldResult = await updateTaskSummaryField(taskId, generatedTitle);
-    summaryFieldCode = summaryFieldResult.field;
-    summaryFieldUpdated = summaryFieldResult.updated;
-    summaryFieldError = summaryFieldResult.error;
-  }
+  // Ветка обновления задачи временно отключена: PATCH задачи запускает новый ONTASKUPDATE.
+  // if (generatedTitle) {
+  //   const summaryFieldResult = await updateTaskSummaryField(taskId, generatedTitle);
+  //   summaryFieldCode = summaryFieldResult.field;
+  //   summaryFieldUpdated = summaryFieldResult.updated;
+  //   summaryFieldError = summaryFieldResult.error;
+  // }
 
   return {
     ok: true,
