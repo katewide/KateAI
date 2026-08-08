@@ -918,7 +918,6 @@ async function prepareTaskChatImages(task, scope) {
     const messageSource = `${scope}.chat:${chat.chatId}.message:${message?.id || message?.ID || 'unknown'}`;
     return [
       ...collectImageCandidates(getCommentMessage(message), `${messageSource}.text`),
-      ...getMessageFileIds(message).map(fileId => ({ source: `${messageSource}.params.fileId`, fileId })),
     ];
   });
 
@@ -964,7 +963,7 @@ async function prepareTaskChatAudioTranscripts(task, scope) {
     .slice(0, AI_MAX_AUDIO_FILES);
 
   const transcripts = [];
-  const candidates = files.map(file => ({
+  const fileCandidates = files.map(file => ({
     source: `${scope}.chat:${chat.chatId}.audio:${file?.id || file?.ID || 'unknown'}`,
     fileId: file?.id || file?.ID || null,
     name: file?.name || file?.NAME || null,
@@ -973,6 +972,22 @@ async function prepareTaskChatAudioTranscripts(task, scope) {
     size: file?.size || file?.SIZE || null,
     isVoiceNote: Boolean(file?.isVoiceNote || file?.IS_VOICE_NOTE),
   }));
+  const knownAudioFileIds = new Set(fileCandidates.map(candidate => String(candidate.fileId || '')).filter(Boolean));
+  const messageCandidates = humanMessages.flatMap(message => {
+    const messageSource = `${scope}.chat:${chat.chatId}.message:${message?.id || message?.ID || 'unknown'}`;
+    return getMessageFileIds(message)
+      .filter(fileId => !knownAudioFileIds.has(String(fileId)))
+      .map(fileId => ({
+        source: `${messageSource}.params.fileId`,
+        fileId,
+        name: null,
+        mimeType: null,
+        url: null,
+        size: null,
+        isVoiceNote: null,
+      }));
+  });
+  const candidates = [...fileCandidates, ...messageCandidates].slice(0, AI_MAX_AUDIO_FILES);
 
   for (const candidate of candidates) {
     try {
