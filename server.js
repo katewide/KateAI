@@ -34,8 +34,7 @@ const AI_SUPPORTED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image
 const AUDIO_TRANSCRIPTION_MODEL = 'bitrix/deepdml/faster-whisper-large-v3-turbo-ct2';
 const AI_MAX_AUDIO_FILES = 10;
 const AI_MAX_AUDIO_BYTES = 25 * 1024 * 1024;
-const TASK_SUMMARY_FIELD_CODE = 'UF_AUTO_669590144190';
-const TASK_SUMMARY_FIELD_FALLBACK_CODE = 'ufAuto669590144190';
+const TASK_SUMMARY_FIELD_CODE = 'UF_TASK_TITLE';
 
 let taskTimeCheckInProgress = false;
 let taskTimeCheckStartedAt = null;
@@ -1551,19 +1550,12 @@ async function updateTaskSummaryField(taskId, value) {
       [TASK_SUMMARY_FIELD_CODE]: value,
     });
     return { updated: true, field: TASK_SUMMARY_FIELD_CODE, error: null };
-  } catch (firstError) {
-    try {
-      await coworkRequest('PATCH', `/tasks/${taskId}`, {
-        [TASK_SUMMARY_FIELD_FALLBACK_CODE]: value,
-      });
-      return { updated: true, field: TASK_SUMMARY_FIELD_FALLBACK_CODE, error: null };
-    } catch (secondError) {
-      return {
-        updated: false,
-        field: TASK_SUMMARY_FIELD_CODE,
-        error: `${firstError.message}; fallback ${TASK_SUMMARY_FIELD_FALLBACK_CODE}: ${secondError.message}`,
-      };
-    }
+  } catch (error) {
+    return {
+      updated: false,
+      field: TASK_SUMMARY_FIELD_CODE,
+      error: error.message,
+    };
   }
 }
 
@@ -1886,13 +1878,12 @@ async function processClosedTask(taskId) {
   let summaryFieldCode = TASK_SUMMARY_FIELD_CODE;
   let summaryFieldError = null;
 
-  // Ветка обновления задачи временно отключена: PATCH задачи запускает новый ONTASKUPDATE.
-  // if (generatedTitle) {
-  //   const summaryFieldResult = await updateTaskSummaryField(taskId, generatedTitle);
-  //   summaryFieldCode = summaryFieldResult.field;
-  //   summaryFieldUpdated = summaryFieldResult.updated;
-  //   summaryFieldError = summaryFieldResult.error;
-  // }
+  if (generatedTitle) {
+    const summaryFieldResult = await updateTaskSummaryField(taskId, generatedTitle);
+    summaryFieldCode = summaryFieldResult.field;
+    summaryFieldUpdated = summaryFieldResult.updated;
+    summaryFieldError = summaryFieldResult.error;
+  }
 
   return {
     ok: true,
