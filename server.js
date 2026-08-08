@@ -1740,11 +1740,11 @@ ${JSON.stringify(contextparentID, null, 2)}
 [b]📝 TITLE:[/b]
 Обновление базы ... на релиз <фактический релиз>
 
-
 Если информации недостаточно, вместо SUMMARY и TITLE выведи только: INSUFFICIENT_INFORMATION`;
 }
 
-async function processClosedTask(taskId) {
+async function processClosedTask(taskId, options = {}) {
+  const dryRun = Boolean(options.dryRun);
   const { task: mainTask, comments: mainComments, commentsSource } = await fetchTaskWithComments(taskId);
   const filteredMainComments = filterGemmaComments(mainComments);
   const parentId = getParentIdFromTask(mainTask);
@@ -1883,12 +1883,15 @@ async function processClosedTask(taskId) {
   if (isInsufficientInfoComment(aiComment)) {
     if (timeSpentInLogs > 0) {
       const insufficientInfoComment = buildInsufficientInfoComment(responsibleId);
-      await coworkRequest('POST', `/tasks/${taskId}/comments`, {
-        message: insufficientInfoComment,
-      });
+      if (!dryRun) {
+        await coworkRequest('POST', `/tasks/${taskId}/comments`, {
+          message: insufficientInfoComment,
+        });
+      }
 
       return {
         ok: true,
+        dry_run: dryRun,
         task_id: taskId,
         parent_id: parentId || null,
         responsible_id: responsibleId,
@@ -1900,11 +1903,13 @@ async function processClosedTask(taskId) {
         ai_images_count: aiImages.length,
         current_image_facts_found: Boolean(mainImageFacts),
         parent_image_facts_found: Boolean(parentImageFacts),
-        comment_posted: true,
+        comment_posted: !dryRun,
+        comment_would_be_posted: dryRun,
         summary_field: TASK_SUMMARY_FIELD_CODE,
         summary_field_updated: false,
         summary_field_error: null,
         generated_title: null,
+        raw_ai_comment: aiComment,
         ai_comment: insufficientInfoComment,
       };
     }
@@ -1930,15 +1935,17 @@ async function processClosedTask(taskId) {
 
   const commentToPost = isSummaryOnlyGroup(groupId) ? extractSummaryFromAiComment(aiComment) : aiComment;
 
-  await coworkRequest('POST', `/tasks/${taskId}/comments`, {
-    message: commentToPost,
-  });
+  if (!dryRun) {
+    await coworkRequest('POST', `/tasks/${taskId}/comments`, {
+      message: commentToPost,
+    });
+  }
   const generatedTitle = extractTitleFromAiComment(aiComment);
   let summaryFieldUpdated = false;
   let summaryFieldCode = TASK_SUMMARY_FIELD_CODE;
   let summaryFieldError = null;
 
-  if (generatedTitle && !isSummaryOnlyGroup(groupId)) {
+  if (generatedTitle && !isSummaryOnlyGroup(groupId) && !dryRun) {
     const summaryFieldResult = await updateTaskSummaryField(taskId, generatedTitle);
     summaryFieldCode = summaryFieldResult.field;
     summaryFieldUpdated = summaryFieldResult.updated;
@@ -1947,6 +1954,7 @@ async function processClosedTask(taskId) {
 
   return {
     ok: true,
+    dry_run: dryRun,
     task_id: taskId,
     parent_id: parentId || null,
     responsible_id: responsibleId,
@@ -1958,11 +1966,14 @@ async function processClosedTask(taskId) {
     ai_images_count: aiImages.length,
     current_image_facts_found: Boolean(mainImageFacts),
     parent_image_facts_found: Boolean(parentImageFacts),
-    comment_posted: true,
+    comment_posted: !dryRun,
+    comment_would_be_posted: dryRun,
     summary_field: summaryFieldCode,
     summary_field_updated: summaryFieldUpdated,
+    summary_field_would_be_updated: Boolean(generatedTitle && !isSummaryOnlyGroup(groupId) && dryRun),
     summary_field_error: summaryFieldError,
     generated_title: generatedTitle,
+    raw_ai_comment: aiComment,
     ai_comment: commentToPost,
   };
 }
@@ -2026,6 +2037,102 @@ function sendJson(res, statusCode, data) {
   res.end(JSON.stringify(data));
 }
 
+function sendAiTestPage(res) {
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(`<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI preview</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 24px; color: #1f2937; background: #f6f7f9; }
+    main { max-width: 1100px; margin: 0 auto; }
+    form { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; }
+    input { font-size: 16px; padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 6px; width: 160px; }
+    button { font-size: 16px; padding: 9px 14px; border: 0; border-radius: 6px; background: #2563eb; color: white; cursor: pointer; }
+    button:disabled { opacity: .65; cursor: default; }
+    section { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; margin-top: 12px; }
+    h1 { font-size: 24px; margin: 0 0 16px; }
+    h2 { font-size: 16px; margin: 0 0 10px; }
+    pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-size: 14px; line-height: 1.45; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+    .muted { color: #64748b; }
+    .error { color: #b91c1c; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>AI preview</h1>
+    <form id="form">
+      <input id="taskId" name="taskId" value="184538" inputmode="numeric">
+      <button id="run" type="submit">Запустить</button>
+      <span id="status" class="muted"></span>
+    </form>
+    <div class="grid">
+      <section>
+        <h2>Что было бы опубликовано</h2>
+        <pre id="final"></pre>
+      </section>
+      <section>
+        <h2>Сырой ответ AI</h2>
+        <pre id="raw"></pre>
+      </section>
+    </div>
+    <section>
+      <h2>Детали</h2>
+      <pre id="details"></pre>
+    </section>
+  </main>
+  <script>
+    const form = document.getElementById('form');
+    const run = document.getElementById('run');
+    const status = document.getElementById('status');
+    const final = document.getElementById('final');
+    const raw = document.getElementById('raw');
+    const details = document.getElementById('details');
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      run.disabled = true;
+      status.textContent = 'Анализирую...';
+      final.textContent = '';
+      raw.textContent = '';
+      details.textContent = '';
+
+      try {
+        const taskId = document.getElementById('taskId').value.trim();
+        const response = await fetch('/ai-preview?taskId=' + encodeURIComponent(taskId));
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || 'Ошибка запроса');
+
+        final.textContent = data.ai_comment || '';
+        raw.textContent = data.raw_ai_comment || '';
+        details.textContent = JSON.stringify({
+          task_id: data.task_id,
+          group_id: data.group_id,
+          time_spent_in_logs: data.time_spent_in_logs,
+          comment_would_be_posted: data.comment_would_be_posted,
+          summary_field: data.summary_field,
+          summary_field_would_be_updated: data.summary_field_would_be_updated,
+          generated_title: data.generated_title,
+          current_image_facts_found: data.current_image_facts_found,
+          parent_image_facts_found: data.parent_image_facts_found,
+        }, null, 2);
+        status.textContent = 'Готово';
+      } catch (error) {
+        status.textContent = 'Ошибка';
+        final.textContent = error.message;
+        final.className = 'error';
+      } finally {
+        run.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>`);
+}
+
 function getNextTaskTimeCheckDate(now = new Date()) {
   const scheduledUtcHour = TASK_TIME_CHECK_HOUR_MSK - MSK_UTC_OFFSET_HOURS;
   const nextRun = new Date(Date.UTC(
@@ -2084,6 +2191,33 @@ const server = http.createServer(async (req, res) => {
         taskTimeCheckStage,
         ...debugState,
       });
+      return;
+    }
+
+    if ((req.method === 'GET' || req.method === 'HEAD') && pathname === '/ai-test') {
+      if (req.method === 'HEAD') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end();
+      } else {
+        sendAiTestPage(res);
+      }
+      return;
+    }
+
+    if ((req.method === 'GET' || req.method === 'HEAD') && pathname === '/ai-preview') {
+      const taskId = new URL(req.url, `http://${req.headers.host || 'localhost'}`).searchParams.get('taskId') || '184538';
+      if (!normalizeId(taskId)) {
+        sendJson(res, 400, { ok: false, error: 'Invalid taskId' });
+        return;
+      }
+
+      if (req.method === 'HEAD') {
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      const result = await processClosedTask(taskId, { dryRun: true });
+      sendJson(res, 200, result);
       return;
     }
 
