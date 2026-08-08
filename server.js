@@ -418,6 +418,11 @@ function getGroupNameFromTask(task) {
   return task?.groupName || task?.group?.name || task?.group?.title || null;
 }
 
+function getTaskChatId(task) {
+  const chatId = task?.chatId || task?.CHAT_ID || task?.chat?.id;
+  return chatId ? String(chatId).replace(/^chat/i, '') : null;
+}
+
 function isCollabGroupName(groupName) {
   return String(groupName || '').toLowerCase().includes('коллаба');
 }
@@ -454,6 +459,35 @@ function normalizeCommentsPayload(response) {
   const data = unwrapData(response);
   const comments = data?.comments || data?.Comments || data?.items || data?.list || data;
   return Array.isArray(comments) ? comments : [];
+}
+
+function normalizeChatMessagesPayload(response) {
+  const data = unwrapData(response);
+  const messages = data?.messages || data?.Messages || data?.items || data?.list || data;
+  return Array.isArray(messages) ? messages : [];
+}
+
+function normalizeChatFilesPayload(response) {
+  const data = unwrapData(response);
+  const files = data?.files || data?.Files || [];
+  return Array.isArray(files) ? files : [];
+}
+
+async function fetchTaskChatMessages(task) {
+  const chatId = getTaskChatId(task);
+  if (!chatId) return { chatId: null, messages: [], files: [] };
+
+  try {
+    const response = await coworkRequest('GET', `/chats/chat${chatId}/messages`);
+    return {
+      chatId,
+      messages: normalizeChatMessagesPayload(response),
+      files: normalizeChatFilesPayload(response),
+    };
+  } catch (error) {
+    log('Task chat messages fetch failed', { chat_id: chatId, error: error.message });
+    return { chatId, messages: [], files: [] };
+  }
 }
 
 function getCommentAuthorId(comment) {
@@ -511,6 +545,17 @@ function getKnownFileIds(value) {
     .filter(item => /^\d+$/.test(item));
 }
 
+function getMessageFileIds(message) {
+  return getKnownFileIds(
+    message?.params?.fileId ??
+    message?.PARAMS?.FILE_ID ??
+    message?.files ??
+    message?.FILES ??
+    message?.attachments ??
+    message?.ATTACHMENTS
+  );
+}
+
 function extractFileIdsFromText(text) {
   const value = String(text || '');
   const ids = [];
@@ -553,20 +598,29 @@ function getCommentMessage(comment) {
   return comment?.message || comment?.MESSAGE || comment?.text || comment?.TEXT || '';
 }
 
+function getTaskTextFields(task) {
+  return [
+    task?.description,
+    task?.DESCRIPTION,
+    task?.descriptionInBbcode,
+    task?.DESCRIPTION_IN_BBCODE,
+  ].filter(value => typeof value === 'string' && value.trim());
+}
+
 function getObjectImageCandidate(object, source) {
   if (!object || typeof object !== 'object') return null;
 
   const name = object.name || object.NAME || object.fileName || object.FILENAME || object.title || object.TITLE;
+  const objectType = object.type || object.TYPE;
   const mimeType = normalizeMimeType(
     object.mimeType ||
     object.MIME_TYPE ||
     object.contentType ||
     object.CONTENT_TYPE ||
-    object.type ||
-    object.TYPE ||
+    (objectType === 'image' ? getMimeTypeFromName(name) : objectType) ||
     getMimeTypeFromName(name)
   );
-  const url = object.downloadUrl || object.downloadURL || object.DOWNLOAD_URL || object.url || object.URL || object.link || object.LINK;
+  const url = object.downloadUrl || object.downloadURL || object.DOWNLOAD_URL || object.urlDownload || object.URL_DOWNLOAD || object.urlPreview || object.URL_PREVIEW || object.urlShow || object.URL_SHOW || object.url || object.URL || object.link || object.LINK;
   const dataUrl = typeof url === 'string' && url.startsWith('data:image/') ? url : null;
 
   if (!dataUrl && !isSupportedImageMimeType(mimeType) && !getMimeTypeFromName(name)) {
@@ -673,6 +727,7 @@ async function downloadImageCandidate(candidate) {
 
 async function prepareTaskImages(task, comments, scope) {
   const candidates = dedupeImageCandidates([
+    ...getTaskTextFields(task).flatMap((text, index) => collectImageCandidates(text, `${scope}.task.text:${index}`)),
     ...getAttachmentFields(task).flatMap(field => collectImageCandidates(field, `${scope}.task.attachments`)),
     ...comments.flatMap(comment => {
       const commentSource = `${scope}.comment:${comment?.id || comment?.ID || 'unknown'}`;
@@ -699,7 +754,66 @@ async function prepareTaskImages(task, comments, scope) {
     }
   }
 
-  return { candidatesCount: candidates.length, images };
+  return {
+    candidatesCount: candidates.length,
+    candidates: candidates.map(candidate => ({
+      source: candidate.source,
+      name: candidate.name || null,
+      mimeType: candidate.mimeType || null,
+      fileId: candidate.fileId || null,
+      url: candidate.url || null,
+      hasDataUrl: Boolean(candidate.dataUrl),
+    })),
+    images,
+  };
+}
+
+async function prepareTaskChatImages(task, scope) {
+  const chat = await fetchTaskChatMessages(task);
+  const humanMessages = chat.messages.filter(message => !message?.isSystem && !isGemmaComment(message));
+  const messageFileIds = new Set(humanMessages.flatMap(getMessageFileIds));
+  const fileCandidates = chat.files
+    .filter(file => !messageFileIds.size || messageFileIds.has(String(file?.id || file?.ID)))
+    .flatMap(file => collectImageCandidates(file, `${scope}.chat:${chat.chatId}.file:${file?.id || file?.ID || 'unknown'}`));
+
+  const messageCandidates = humanMessages.flatMap(message => {
+    const messageSource = `${scope}.chat:${chat.chatId}.message:${message?.id || message?.ID || 'unknown'}`;
+    return [
+      ...collectImageCandidates(getCommentMessage(message), `${messageSource}.text`),
+      ...getMessageFileIds(message).map(fileId => ({ source: `${messageSource}.params.fileId`, fileId })),
+    ];
+  });
+
+  const candidates = dedupeImageCandidates([...fileCandidates, ...messageCandidates]);
+  const images = [];
+  for (const candidate of candidates) {
+    if (images.length >= AI_MAX_IMAGES) break;
+    try {
+      const image = await downloadImageCandidate(candidate);
+      if (image?.dataUrl) images.push(image);
+    } catch (error) {
+      log('Chat image skipped', {
+        source: candidate.source,
+        file_id: candidate.fileId || null,
+        url: candidate.url || null,
+        error: error.message,
+      });
+    }
+  }
+
+  return {
+    chatId: chat.chatId,
+    candidatesCount: candidates.length,
+    candidates: candidates.map(candidate => ({
+      source: candidate.source,
+      name: candidate.name || null,
+      mimeType: candidate.mimeType || null,
+      fileId: candidate.fileId || null,
+      url: candidate.url || null,
+      hasDataUrl: Boolean(candidate.dataUrl),
+    })),
+    images,
+  };
 }
 
 function buildAiMessageContent(prompt, images) {
@@ -1451,10 +1565,12 @@ async function processClosedTask(taskId) {
   }
 
   const mainImageResult = await prepareTaskImages(mainTask, filteredMainComments, 'currentTask');
-  const mainImages = mainImageResult.images;
+  const mainChatImageResult = await prepareTaskChatImages(mainTask, 'currentTask');
+  const mainImages = [...mainImageResult.images, ...mainChatImageResult.images].slice(0, AI_MAX_IMAGES);
   const mainImageFacts = await extractImageFacts(mainImages, 'текущей задачи');
   let parentImages = [];
   let parentImageCandidatesCount = 0;
+  let parentImageCandidates = [];
   let parentImageFacts = null;
 
   if (parentId && parentId !== '0') {
@@ -1462,8 +1578,10 @@ async function processClosedTask(taskId) {
     const filteredParentComments = filterGemmaComments(parentComments);
     const parentTimeLogs = await fetchTaskTimeLogs(parentId);
     const parentImageResult = await prepareTaskImages(parentTask, filteredParentComments, 'parentTask');
-    parentImages = parentImageResult.images;
-    parentImageCandidatesCount = parentImageResult.candidatesCount;
+    const parentChatImageResult = await prepareTaskChatImages(parentTask, 'parentTask');
+    parentImages = [...parentImageResult.images, ...parentChatImageResult.images].slice(0, AI_MAX_IMAGES);
+    parentImageCandidatesCount = parentImageResult.candidatesCount + parentChatImageResult.candidatesCount;
+    parentImageCandidates = [...parentImageResult.candidates, ...parentChatImageResult.candidates];
     parentImageFacts = await extractImageFacts(parentImages, 'родительской задачи');
     contextparentID = {
       parentId,
@@ -1479,7 +1597,9 @@ async function processClosedTask(taskId) {
   const aiImages = [...mainImages, ...parentImages].slice(0, AI_MAX_IMAGES);
   saveDebug('lastTaskImages', {
     task_id: taskId,
-    ai_image_candidates_count: mainImageResult.candidatesCount + parentImageCandidatesCount,
+    ai_image_candidates_count: mainImageResult.candidatesCount + mainChatImageResult.candidatesCount + parentImageCandidatesCount,
+    current_image_candidates: [...mainImageResult.candidates, ...mainChatImageResult.candidates],
+    parent_image_candidates: parentImageCandidates,
     ai_images_count: aiImages.length,
     ai_images: getImageMetadata(aiImages),
     current_image_facts_found: Boolean(mainImageFacts),
