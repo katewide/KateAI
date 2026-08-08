@@ -8,23 +8,10 @@ function requireEnv(name) {
   return value;
 }
 
-function getBitrixRestWebhookUrl() {
-  const webhookUrl = (
-    process.env.BITRIX_REST_WEBHOOK_URL ||
-    process.env.WEBHOOK_COMMENT_URL
-  );
-  if (!webhookUrl) throw new Error('Missing required env BITRIX_REST_WEBHOOK_URL');
-
-  return webhookUrl
-    .replace(/task\.commentitem\.add(?:\.json)?$/i, '')
-    .replace(/\/?$/, '/');
-}
-
 const PORT = process.env.PORT || 3000;
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const MODEL_NAME = process.env.MODEL_NAME || 'bitrix/bitrixgpt-5.5';
-const BITRIX_REST_WEBHOOK_URL = getBitrixRestWebhookUrl();
 const WEBHOOK_TOKEN = requireEnv('WEBHOOK_TOKEN');
 const ELAPSED_NOTIFICATION_CHAT_ID = process.env.ELAPSED_NOTIFICATION_CHAT_ID || 'chat42358';
 const BITRIX_PORTAL_URL = process.env.BITRIX_PORTAL_URL || 'https://elros.bitrix24.ru';
@@ -288,18 +275,6 @@ function requestBuffer(endpoint, options = {}, redirectCount = 0) {
     });
     if (requestOptions.body) req.write(requestOptions.body);
     req.end();
-  });
-}
-
-function bitrixCall(method, params = {}) {
-  const endpoint = new URL(`${method}.json`, BITRIX_REST_WEBHOOK_URL);
-  const body = new URLSearchParams();
-  appendParams(body, params);
-
-  return requestJson(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString(),
   });
 }
 
@@ -783,15 +758,7 @@ async function downloadImageCandidate(candidate) {
 
   let downloaded = null;
   if (candidate.fileId) {
-    try {
-      downloaded = await coworkDownload(`/files/${candidate.fileId}/download`);
-    } catch (error) {
-      const fileResponse = await bitrixCall('disk.file.get', { id: candidate.fileId });
-      const file = unwrapData(fileResponse);
-      const downloadUrl = file?.DOWNLOAD_URL || file?.downloadUrl || file?.download_url;
-      if (!downloadUrl) throw error;
-      downloaded = await requestBuffer(new URL(downloadUrl), { method: 'GET' });
-    }
+    downloaded = await coworkDownload(`/files/${candidate.fileId}/download`);
   } else if (candidate.url) {
     downloaded = await requestBuffer(new URL(candidate.url), { method: 'GET' });
   }
@@ -1533,19 +1500,16 @@ async function addAccomplice(taskId, userId) {
   return { added: true, taskId, userId: normalizedUserId };
 }
 
+function normalizeTaskHistoryPayload(response) {
+  const data = unwrapData(response);
+  const history = data?.history || data?.items || data?.list || data;
+  return Array.isArray(history) ? history : [];
+}
+
 async function getTaskHistory(taskId) {
-  const response = await bitrixCall('tasks.task.history.list', {
-    taskId,
-    order: { createdDate: 'DESC' },
-  });
+  const response = await coworkRequest('GET', `/tasks/${encodeURIComponent(taskId)}/history?order=desc`);
 
-  const history = Array.isArray(response?.result?.list)
-    ? response.result.list
-    : Array.isArray(response?.result)
-      ? response.result
-      : [];
-
-  return history
+  return normalizeTaskHistoryPayload(response)
     .map(item => ({ ...item, createdAtMs: Date.parse(item.createdDate) }))
     .filter(item => Number.isFinite(item.createdAtMs))
     .sort((a, b) => b.createdAtMs - a.createdAtMs);
