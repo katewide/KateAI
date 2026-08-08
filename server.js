@@ -44,6 +44,9 @@ const AI_MAX_IMAGES = 15;
 const AI_MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const AI_MAX_TOTAL_IMAGE_BYTES = 28 * 1024 * 1024;
 const AI_SUPPORTED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const AUDIO_TRANSCRIPTION_MODEL = 'bitrix/deepdml/faster-whisper-large-v3-turbo-ct2';
+const AI_MAX_AUDIO_FILES = 10;
+const AI_MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 
 let taskTimeCheckInProgress = false;
 let taskTimeCheckStartedAt = null;
@@ -208,10 +211,15 @@ function requestJson(endpoint, options = {}) {
 
 function requestBuffer(endpoint, options = {}, redirectCount = 0) {
   const client = endpoint.protocol === 'https:' ? https : http;
+  const maxBytes = options.maxBytes || AI_MAX_IMAGE_BYTES;
+  const sizeLabel = options.sizeLabel || 'File';
+  const requestOptions = { ...options };
+  delete requestOptions.maxBytes;
+  delete requestOptions.sizeLabel;
 
   return new Promise((resolve, reject) => {
     let settled = false;
-    const req = client.request(endpoint, options, res => {
+    const req = client.request(endpoint, requestOptions, res => {
       const location = res.headers.location;
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && location && redirectCount < 3) {
         res.resume();
@@ -226,10 +234,10 @@ function requestBuffer(endpoint, options = {}, redirectCount = 0) {
       }
 
       const contentLength = Number.parseInt(res.headers['content-length'] || '0', 10);
-      if (Number.isFinite(contentLength) && contentLength > AI_MAX_IMAGE_BYTES) {
+      if (Number.isFinite(contentLength) && contentLength > maxBytes) {
         settled = true;
         res.resume();
-        reject(new Error(`Image is too large: ${contentLength} bytes`));
+        reject(new Error(`${sizeLabel} is too large: ${contentLength} bytes`));
         return;
       }
 
@@ -239,10 +247,10 @@ function requestBuffer(endpoint, options = {}, redirectCount = 0) {
       res.on('data', chunk => {
         if (settled) return;
         total += chunk.length;
-        if (total > AI_MAX_IMAGE_BYTES) {
+        if (total > maxBytes) {
           settled = true;
-          reject(new Error(`Image is too large: ${total} bytes`));
-          req.destroy(new Error(`Image is too large: ${total} bytes`));
+          reject(new Error(`${sizeLabel} is too large: ${total} bytes`));
+          req.destroy(new Error(`${sizeLabel} is too large: ${total} bytes`));
           return;
         }
         chunks.push(chunk);
@@ -276,7 +284,7 @@ function requestBuffer(endpoint, options = {}, redirectCount = 0) {
       settled = true;
       reject(error);
     });
-    if (options.body) req.write(options.body);
+    if (requestOptions.body) req.write(requestOptions.body);
     req.end();
   });
 }
@@ -308,6 +316,42 @@ function coworkDownload(path) {
   return requestBuffer(new URL(`/v1${path}`, BASE_URL), {
     method: 'GET',
     headers: { 'X-Api-Key': API_KEY },
+  });
+}
+
+function escapeMultipartName(value) {
+  return String(value || '').replace(/"/g, '\\"');
+}
+
+function buildMultipartBody(fields, file) {
+  const boundary = `----codex-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const chunks = [];
+
+  for (const [name, value] of Object.entries(fields)) {
+    chunks.push(Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="${escapeMultipartName(name)}"\r\n\r\n${value}\r\n`
+    ));
+  }
+
+  chunks.push(Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="${escapeMultipartName(file.fieldName)}"; filename="${escapeMultipartName(file.filename)}"\r\nContent-Type: ${file.contentType || 'application/octet-stream'}\r\n\r\n`
+  ));
+  chunks.push(file.buffer);
+  chunks.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+
+  return { boundary, body: Buffer.concat(chunks) };
+}
+
+function coworkMultipartRequest(path, fields, file) {
+  const { boundary, body } = buildMultipartBody(fields, file);
+  return requestJson(new URL(`/v1${path}`, BASE_URL), {
+    method: 'POST',
+    headers: {
+      'X-Api-Key': API_KEY,
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      'Content-Length': body.length,
+    },
+    body,
   });
 }
 
@@ -541,8 +585,25 @@ function getMimeTypeFromName(name) {
   return null;
 }
 
+function getAudioMimeTypeFromName(name) {
+  const lowerName = String(name || '').toLowerCase();
+  if (lowerName.endsWith('.m4a')) return 'audio/mp4';
+  if (lowerName.endsWith('.mp3')) return 'audio/mpeg';
+  if (lowerName.endsWith('.wav')) return 'audio/wav';
+  if (lowerName.endsWith('.ogg') || lowerName.endsWith('.oga')) return 'audio/ogg';
+  if (lowerName.endsWith('.webm')) return 'audio/webm';
+  if (lowerName.endsWith('.mp4')) return 'audio/mp4';
+  return null;
+}
+
 function isSupportedImageMimeType(mimeType) {
   return AI_SUPPORTED_IMAGE_MIME_TYPES.has(normalizeMimeType(mimeType));
+}
+
+function isAudioFileObject(file) {
+  const type = String(file?.type || file?.TYPE || '').toLowerCase();
+  const name = file?.name || file?.NAME || file?.fileName || file?.FILENAME;
+  return type === 'audio' || file?.isTranscribable === true || file?.IS_TRANSCRIBABLE === true || Boolean(getAudioMimeTypeFromName(name));
 }
 
 function getKnownFileIds(value) {
@@ -746,6 +807,62 @@ async function downloadImageCandidate(candidate) {
   };
 }
 
+function getFileDownloadUrl(file) {
+  return file?.downloadUrl || file?.downloadURL || file?.DOWNLOAD_URL || file?.urlDownload || file?.URL_DOWNLOAD || file?.urlShow || file?.URL_SHOW || file?.viewerAttrs?.src || file?.VIEWER_ATTRS?.SRC || null;
+}
+
+async function downloadAudioCandidate(candidate) {
+  let downloaded = null;
+  if (candidate.fileId) {
+    try {
+      downloaded = await requestBuffer(new URL(`/v1/files/${candidate.fileId}/download`, BASE_URL), {
+        method: 'GET',
+        headers: { 'X-Api-Key': API_KEY },
+        maxBytes: AI_MAX_AUDIO_BYTES,
+        sizeLabel: 'Audio',
+      });
+    } catch (error) {
+      if (!candidate.url) throw error;
+      downloaded = await requestBuffer(new URL(candidate.url), {
+        method: 'GET',
+        maxBytes: AI_MAX_AUDIO_BYTES,
+        sizeLabel: 'Audio',
+      });
+    }
+  } else if (candidate.url) {
+    downloaded = await requestBuffer(new URL(candidate.url), {
+      method: 'GET',
+      maxBytes: AI_MAX_AUDIO_BYTES,
+      sizeLabel: 'Audio',
+    });
+  }
+
+  if (!downloaded?.buffer?.length) return null;
+
+  const mimeType = normalizeMimeType(downloaded.contentType || candidate.mimeType || getAudioMimeTypeFromName(candidate.name)) || 'application/octet-stream';
+  return {
+    ...candidate,
+    mimeType,
+    bytes: downloaded.buffer.length,
+    buffer: downloaded.buffer,
+  };
+}
+
+async function transcribeAudio(audio) {
+  const response = await coworkMultipartRequest('/audio/transcriptions', {
+    model: AUDIO_TRANSCRIPTION_MODEL,
+    language: 'ru',
+    response_format: 'json',
+  }, {
+    fieldName: 'file',
+    filename: audio.name || `audio-${audio.fileId || Date.now()}.m4a`,
+    contentType: audio.mimeType || 'application/octet-stream',
+    buffer: audio.buffer,
+  });
+
+  return response?.text || response?.data?.text || null;
+}
+
 async function prepareTaskImages(task, comments, scope) {
   const candidates = dedupeImageCandidates([
     ...getTaskTextFields(task).flatMap((text, index) => collectImageCandidates(text, `${scope}.task.text:${index}`)),
@@ -834,6 +951,57 @@ async function prepareTaskChatImages(task, scope) {
       hasDataUrl: Boolean(candidate.dataUrl),
     })),
     images,
+  };
+}
+
+async function prepareTaskChatAudioTranscripts(task, scope) {
+  const chat = await fetchTaskChatMessages(task);
+  const humanMessages = chat.messages.filter(isUserChatMessage).filter(message => !isGemmaComment(message));
+  const messageFileIds = new Set(humanMessages.flatMap(getMessageFileIds));
+  const files = chat.files
+    .filter(isAudioFileObject)
+    .filter(file => !messageFileIds.size || messageFileIds.has(String(file?.id || file?.ID)))
+    .slice(0, AI_MAX_AUDIO_FILES);
+
+  const transcripts = [];
+  const candidates = files.map(file => ({
+    source: `${scope}.chat:${chat.chatId}.audio:${file?.id || file?.ID || 'unknown'}`,
+    fileId: file?.id || file?.ID || null,
+    name: file?.name || file?.NAME || null,
+    mimeType: getAudioMimeTypeFromName(file?.name || file?.NAME) || null,
+    url: getFileDownloadUrl(file),
+    size: file?.size || file?.SIZE || null,
+    isVoiceNote: Boolean(file?.isVoiceNote || file?.IS_VOICE_NOTE),
+  }));
+
+  for (const candidate of candidates) {
+    try {
+      const audio = await downloadAudioCandidate(candidate);
+      if (!audio) continue;
+      const text = await transcribeAudio(audio);
+      if (text) {
+        transcripts.push({
+          source: candidate.source,
+          fileId: candidate.fileId,
+          name: candidate.name,
+          bytes: audio.bytes,
+          text,
+        });
+      }
+    } catch (error) {
+      log('Audio transcription skipped', {
+        source: candidate.source,
+        file_id: candidate.fileId || null,
+        error: error.message,
+      });
+    }
+  }
+
+  return {
+    chatId: chat.chatId,
+    candidatesCount: candidates.length,
+    candidates,
+    transcripts,
   };
 }
 
@@ -1392,7 +1560,7 @@ function getImageMetadata(images) {
   }));
 }
 
-function buildPrompt({ taskId, groupId, responsibleId, creatorId, mainTask, mainComments, mainTimeLogs, mainTimeSpentInLogs, mainImages, mainImageFacts, contextparentID }) {
+function buildPrompt({ taskId, groupId, responsibleId, creatorId, mainTask, mainComments, mainTimeLogs, mainTimeSpentInLogs, mainImages, mainImageFacts, mainAudioTranscripts, contextparentID }) {
   const context = {
     currentTaskId: taskId,
     groupId,
@@ -1404,6 +1572,7 @@ function buildPrompt({ taskId, groupId, responsibleId, creatorId, mainTask, main
     currentTaskTimeSpentInLogs: mainTimeSpentInLogs,
     currentTaskImages: getImageMetadata(mainImages),
     currentTaskImageFacts: mainImageFacts,
+    currentTaskAudioTranscripts: mainAudioTranscripts,
   };
 
   return `Ты - профессиональный консультант 1С. Твоя задача - проанализировать данные задачи и написать краткий итог. Ты анализируешь задачи компании-франчайзи 1С. Используй профессиональную терминологию, принятую в сфере внедрения и сопровождения продуктов 1С.
@@ -1415,8 +1584,8 @@ ${JSON.stringify(context, null, 2)}
 ${JSON.stringify(contextparentID, null, 2)}
 
 Правила анализа:
-- Основной объект анализа - currentTask, currentTaskComments, currentTaskTimeSpentInLogs, currentTaskId, currentTaskImageFacts.
-- Если контекст родительской задачи не равен null, используй parentTask, parentTaskComments, parentTaskTimeSpentInLogs, parentTaskImageFacts только как дополнительный контекст.
+- Основной объект анализа - currentTask, currentTaskComments, currentTaskTimeSpentInLogs, currentTaskId, currentTaskImageFacts, currentTaskAudioTranscripts.
+- Если контекст родительской задачи не равен null, используй parentTask, parentTaskComments, parentTaskTimeSpentInLogs, parentTaskImageFacts, parentTaskAudioTranscripts только как дополнительный контекст.
 - Если есть несоответствие данных задачи и комментариев, ориентируйся на комментарии.
 - Используй только информацию, содержащуюся в JSON. Ничего не выдумывай и не добавляй от себя.
 - Не добавляй технические детали, если они отсутствуют в исходных данных.
@@ -1595,10 +1764,12 @@ async function processClosedTask(taskId) {
   const mainChatImageResult = await prepareTaskChatImages(mainTask, 'currentTask');
   const mainImages = [...mainImageResult.images, ...mainChatImageResult.images].slice(0, AI_MAX_IMAGES);
   const mainImageFacts = await extractImageFacts(mainImages, 'текущей задачи');
+  const mainAudioResult = await prepareTaskChatAudioTranscripts(mainTask, 'currentTask');
   let parentImages = [];
   let parentImageCandidatesCount = 0;
   let parentImageCandidates = [];
   let parentImageFacts = null;
+  let parentAudioResult = { candidatesCount: 0, candidates: [], transcripts: [] };
 
   if (parentId && parentId !== '0') {
     const { task: parentTask, comments: parentComments, commentsSource: parentCommentsSource } = await fetchTaskWithComments(parentId);
@@ -1610,6 +1781,7 @@ async function processClosedTask(taskId) {
     parentImageCandidatesCount = parentImageResult.candidatesCount + parentChatImageResult.candidatesCount;
     parentImageCandidates = [...parentImageResult.candidates, ...parentChatImageResult.candidates];
     parentImageFacts = await extractImageFacts(parentImages, 'родительской задачи');
+    parentAudioResult = await prepareTaskChatAudioTranscripts(parentTask, 'parentTask');
     contextparentID = {
       parentId,
       parentTask,
@@ -1618,6 +1790,7 @@ async function processClosedTask(taskId) {
       parentTaskTimeSpentInLogs: getTaskTimeSpent(parentTask),
       parentTaskImages: getImageMetadata(parentImages),
       parentTaskImageFacts: parentImageFacts,
+      parentTaskAudioTranscripts: parentAudioResult.transcripts,
       parentTaskCommentsSource: parentCommentsSource,
     };
   }
@@ -1635,6 +1808,12 @@ async function processClosedTask(taskId) {
     parent_image_facts_found: Boolean(parentImageFacts),
     current_image_facts_preview: truncateDebugText(mainImageFacts),
     parent_image_facts_preview: truncateDebugText(parentImageFacts),
+    current_audio_candidates_count: mainAudioResult.candidatesCount,
+    parent_audio_candidates_count: parentAudioResult.candidatesCount,
+    current_audio_transcripts_count: mainAudioResult.transcripts.length,
+    parent_audio_transcripts_count: parentAudioResult.transcripts.length,
+    current_audio_transcripts_preview: truncateDebugText(mainAudioResult.transcripts.map(item => item.text).join('\n\n')),
+    parent_audio_transcripts_preview: truncateDebugText(parentAudioResult.transcripts.map(item => item.text).join('\n\n')),
   });
   const prompt = buildPrompt({
     taskId,
@@ -1647,6 +1826,7 @@ async function processClosedTask(taskId) {
     mainTimeSpentInLogs: timeSpentInLogs,
     mainImages,
     mainImageFacts,
+    mainAudioTranscripts: mainAudioResult.transcripts,
     contextparentID,
   });
 
