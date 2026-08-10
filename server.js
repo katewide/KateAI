@@ -122,6 +122,32 @@ function getErrorMessage(value, fallback = 'Unknown error') {
   return stringifyForLog(value);
 }
 
+function withTimeout(promise, timeoutMs, label) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return promise;
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${label} timeout after ${timeoutMs} ms`));
+    }, timeoutMs);
+
+    promise.then(
+      value => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      error => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
+function safePromise(promise) {
+  promise.catch(() => {});
+  return promise;
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -1132,15 +1158,19 @@ async function extractImageFacts(images, scope, taskId = null) {
         batches: debugBatches,
       });
 
-      const response = await coworkRequest('POST', '/chat/completions', {
-        model: IMAGE_MODEL_NAME,
-        messages: [{
-          role: 'user',
-          content: buildAiMessageContent(prompt, batch),
-        }],
-      }, {
-        timeoutMs: AI_OCR_REQUEST_TIMEOUT_MS,
-      });
+      const response = await withTimeout(
+        safePromise(coworkRequest('POST', '/chat/completions', {
+          model: IMAGE_MODEL_NAME,
+          messages: [{
+            role: 'user',
+            content: buildAiMessageContent(prompt, batch),
+          }],
+        }, {
+          timeoutMs: AI_OCR_REQUEST_TIMEOUT_MS,
+        })),
+        AI_OCR_REQUEST_TIMEOUT_MS,
+        `Image OCR batch ${index + 1}`
+      );
 
       const text = normalizeAiContent(response?.choices?.[0]?.message?.content) || null;
       debugBatches[index].status = text ? 'ok' : 'empty';
@@ -1162,7 +1192,7 @@ async function extractImageFacts(images, scope, taskId = null) {
     saveDebug('lastImageOcr', {
       task_id: taskId,
       scope,
-      status: 'running',
+      status: index === batches.length - 1 ? 'finalizing' : 'running',
       image_model: IMAGE_MODEL_NAME,
       images_count: images.length,
       batches_count: batches.length,
@@ -1175,7 +1205,7 @@ async function extractImageFacts(images, scope, taskId = null) {
   saveDebug('lastImageOcr', {
     task_id: taskId,
     scope,
-    status: facts.length ? 'ok' : 'empty',
+    status: facts.length === batches.length ? 'ok' : facts.length ? 'partial' : 'empty',
     image_model: IMAGE_MODEL_NAME,
     images_count: images.length,
     batches_count: batches.length,
