@@ -24,6 +24,7 @@ const TASK_TIME_CHECK_ENABLED = process.env.TASK_TIME_CHECK_ENABLED !== 'false';
 const TASK_TIME_CHECK_RUN_ON_START = process.env.TASK_TIME_CHECK_RUN_ON_START === 'true';
 const TASK_TIME_ALERT_RETENTION_DAYS = Number(process.env.TASK_TIME_ALERT_RETENTION_DAYS || 180);
 const API_REQUEST_TIMEOUT_MS = Number(process.env.API_REQUEST_TIMEOUT_MS || 60 * 1000);
+const AI_OCR_REQUEST_TIMEOUT_MS = Number(process.env.AI_OCR_REQUEST_TIMEOUT_MS || 30 * 1000);
 const MSK_UTC_OFFSET_HOURS = 3;
 const GEMMA_EXCLUDED_GROUP_IDS = new Set(['12', '92', '376', '490']);
 const GEMMA_COMMENT_AUTHOR_ID = String(process.env.GEMMA_COMMENT_AUTHOR_ID || 204);
@@ -31,7 +32,7 @@ const AI_IMAGE_PROCESSING_ENABLED = true;
 const AI_MAX_IMAGES = 15;
 const AI_MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const AI_MAX_IMAGE_BATCH_BYTES = 18 * 1024 * 1024;
-const AI_MAX_IMAGES_PER_BATCH = 4;
+const AI_MAX_IMAGES_PER_BATCH = 1;
 const AI_SUPPORTED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const AUDIO_TRANSCRIPTION_MODEL = 'bitrix/deepdml/faster-whisper-large-v3-turbo-ct2';
 const AI_MAX_AUDIO_FILES = 10;
@@ -48,10 +49,12 @@ const debugState = {
   lastTaskTimeChatDecision: null,
   lastTaskTimeCheck: null,
   lastTaskCloseDecision: null,
+  lastClosedTaskProcessing: null,
   lastTaskImages: null,
   lastImageOcr: null,
   lastError: null,
 };
+const closedTaskProcessingTaskIds = new Set();
 
 const db = new sqlite3.Database(DB_PATH);
 db.serialize(() => {
@@ -167,10 +170,13 @@ function appendParams(params, value, prefix) {
 
 function requestJson(endpoint, options = {}) {
   const client = endpoint.protocol === 'https:' ? https : http;
+  const timeoutMs = Number(options.timeoutMs || API_REQUEST_TIMEOUT_MS);
+  const requestOptions = { ...options };
+  delete requestOptions.timeoutMs;
 
   return new Promise((resolve, reject) => {
     let settled = false;
-    const req = client.request(endpoint, options, res => {
+    const req = client.request(endpoint, requestOptions, res => {
       let data = '';
       res.setEncoding('utf8');
       res.on('data', chunk => { data += chunk; });
@@ -205,7 +211,7 @@ function requestJson(endpoint, options = {}) {
       });
     });
 
-    req.setTimeout(API_REQUEST_TIMEOUT_MS, () => {
+    req.setTimeout(timeoutMs, () => {
       if (settled) return;
       settled = true;
       req.destroy(new Error(`Request timeout from ${endpoint.pathname}`));
@@ -216,7 +222,7 @@ function requestJson(endpoint, options = {}) {
       settled = true;
       reject(error);
     });
-    if (options.body) req.write(options.body);
+    if (requestOptions.body) req.write(requestOptions.body);
     req.end();
   });
 }
@@ -301,7 +307,7 @@ function requestBuffer(endpoint, options = {}, redirectCount = 0) {
   });
 }
 
-function coworkRequest(method, path, body) {
+function coworkRequest(method, path, body, options = {}) {
   return requestJson(new URL(`/v1${path}`, BASE_URL), {
     method,
     headers: {
@@ -309,6 +315,7 @@ function coworkRequest(method, path, body) {
       'X-Api-Key': API_KEY,
     },
     body: body ? JSON.stringify(body) : undefined,
+    timeoutMs: options.timeoutMs,
   });
 }
 
@@ -1068,7 +1075,7 @@ function truncateDebugText(value, maxLength = 1500) {
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
 }
 
-async function extractImageFacts(images, scope) {
+async function extractImageFacts(images, scope, taskId = null) {
   if (!images.length) return null;
 
   const prompt = `Ты анализируешь изображения, приложенные к задачам технической поддержки 1С.
@@ -1100,6 +1107,7 @@ async function extractImageFacts(images, scope) {
   }));
 
   saveDebug('lastImageOcr', {
+    task_id: taskId,
     scope,
     status: 'started',
     image_model: IMAGE_MODEL_NAME,
@@ -1114,6 +1122,7 @@ async function extractImageFacts(images, scope) {
     try {
       debugBatches[index].status = 'running';
       saveDebug('lastImageOcr', {
+        task_id: taskId,
         scope,
         status: 'running',
         image_model: IMAGE_MODEL_NAME,
@@ -1129,6 +1138,8 @@ async function extractImageFacts(images, scope) {
           role: 'user',
           content: buildAiMessageContent(prompt, batch),
         }],
+      }, {
+        timeoutMs: AI_OCR_REQUEST_TIMEOUT_MS,
       });
 
       const text = normalizeAiContent(response?.choices?.[0]?.message?.content) || null;
@@ -1140,6 +1151,7 @@ async function extractImageFacts(images, scope) {
       debugBatches[index].error = error.message;
       log('Image OCR batch failed', {
         scope,
+        task_id: taskId,
         batch: index + 1,
         images: batch.length,
         bytes: debugBatches[index].bytes,
@@ -1148,6 +1160,7 @@ async function extractImageFacts(images, scope) {
     }
 
     saveDebug('lastImageOcr', {
+      task_id: taskId,
       scope,
       status: 'running',
       image_model: IMAGE_MODEL_NAME,
@@ -1160,6 +1173,7 @@ async function extractImageFacts(images, scope) {
   }
 
   saveDebug('lastImageOcr', {
+    task_id: taskId,
     scope,
     status: facts.length ? 'ok' : 'empty',
     image_model: IMAGE_MODEL_NAME,
@@ -1856,7 +1870,7 @@ ${JSON.stringify(contextparentID, null, 2)}
 3. Точный элемент конфигурации, связанный с причиной проблемы, если он подтвержден исходными данными.
 4. Условия возникновения проблемы, если указаны.
 5. Точные выполненные действия: что именно проверено, изменено, добавлено, удалено, настроено или разработано и в каком объекте.
-6. Подтвержденный результат выполненных работ, если не удалось связаться с заказчиком или он не отвечает, это тоже результат в случае отсутствия других работ.
+6. Подтвержденный результат выполненных работ.
 При формировании SUMMARY сохрани все извлеченные технические наименования, которые необходимы для понимания причины и выполненных работ.
 
 ЗАДАНИЕ:
@@ -1898,9 +1912,9 @@ ${JSON.stringify(contextparentID, null, 2)}
 Проверка достаточности информации:
 - Перед формированием результата оцени, достаточно ли информации для понимания проблемы и выполненных работ.
 - Если из JSON задачи и базовой задачи невозможно определить, в чем заключалась проблема или какие действия были выполнены, не пытайся делать предположения и не придумывай содержание.
-- Если из JSON видно, что клиент задал запрос, а сотрудники пытались связаться или уточнить детали, но клиент не ответил, это не считается недостатком информации. В SUMMARY укажи исходный запрос клиента и факт попыток связи; результат: задача закрыта из-за отсутствия обратной связи.
-- В этом случае не выводи разделы ✅ SUMMARY и 📝 TITLE.
-- Вместо них выведи только следующую строку: INSUFFICIENT_INFORMATION
+- Если из JSON видно, что клиент задал запрос, а сотрудники пытались связаться или уточнить детали, но клиент не ответил, это не считается недостатком информации. В таком случае запрещено выводить INSUFFICIENT_INFORMATION: в SUMMARY укажи исходный запрос клиента и факт попыток связи; результат: задача закрыта из-за отсутствия обратной связи.
+- Только если информации действительно недостаточно, не выводи разделы ✅ SUMMARY и 📝 TITLE.
+- При действительной недостаточности информации вместо них выведи только следующую строку: INSUFFICIENT_INFORMATION
 - Не добавляй никаких других комментариев или пояснений.
 
 Упоминание постановщика:
@@ -1975,7 +1989,21 @@ async function processClosedTask(taskId, options = {}) {
   const mainImageResult = await prepareTaskImages(mainTask, filteredMainComments, 'currentTask');
   const mainChatImageResult = await prepareTaskChatImages(mainTask, 'currentTask');
   const mainImages = [...mainImageResult.images, ...mainChatImageResult.images].slice(0, AI_MAX_IMAGES);
-  const mainImageFacts = await extractImageFacts(mainImages, 'текущей задачи');
+  saveDebug('lastTaskImages', {
+    task_id: taskId,
+    stage: 'current_images_downloaded_before_ocr',
+    comments_source: commentsSource,
+    image_model: IMAGE_MODEL_NAME,
+    summary_model: SUMMARY_MODEL_NAME,
+    ai_image_candidates_count: mainImageResult.candidatesCount + mainChatImageResult.candidatesCount,
+    current_image_candidates: [...mainImageResult.candidates, ...mainChatImageResult.candidates],
+    parent_image_candidates: [],
+    ai_images_count: mainImages.length,
+    ai_images: getImageMetadata(mainImages),
+    current_image_facts_found: false,
+    parent_image_facts_found: false,
+  });
+  const mainImageFacts = await extractImageFacts(mainImages, 'текущей задачи', taskId);
   const mainAudioResult = await prepareTaskChatAudioTranscripts(mainTask, 'currentTask');
   let parentImages = [];
   let parentImageCandidatesCount = 0;
@@ -1992,7 +2020,7 @@ async function processClosedTask(taskId, options = {}) {
     parentImages = [...parentImageResult.images, ...parentChatImageResult.images].slice(0, AI_MAX_IMAGES);
     parentImageCandidatesCount = parentImageResult.candidatesCount + parentChatImageResult.candidatesCount;
     parentImageCandidates = [...parentImageResult.candidates, ...parentChatImageResult.candidates];
-    parentImageFacts = await extractImageFacts(parentImages, 'родительской задачи');
+    parentImageFacts = await extractImageFacts(parentImages, 'родительской задачи', taskId);
     parentAudioResult = await prepareTaskChatAudioTranscripts(parentTask, 'parentTask');
     contextparentID = {
       parentId,
@@ -2182,6 +2210,66 @@ async function processClosedTask(taskId, options = {}) {
   };
 }
 
+function queueClosedTaskProcessing(taskId, trigger) {
+  const normalizedTaskId = String(taskId);
+
+  if (closedTaskProcessingTaskIds.has(normalizedTaskId)) {
+    saveDebug('lastClosedTaskProcessing', {
+      task_id: normalizedTaskId,
+      trigger,
+      status: 'already_running',
+    });
+    return { queued: false, reason: 'closed_task_processing_already_running', task_id: normalizedTaskId };
+  }
+
+  closedTaskProcessingTaskIds.add(normalizedTaskId);
+  saveDebug('lastClosedTaskProcessing', {
+    task_id: normalizedTaskId,
+    trigger,
+    status: 'queued',
+  });
+
+  setTimeout(async () => {
+    saveDebug('lastClosedTaskProcessing', {
+      task_id: normalizedTaskId,
+      trigger,
+      status: 'started',
+    });
+
+    try {
+      await rememberClosedTaskTime(normalizedTaskId);
+      const result = await processClosedTask(normalizedTaskId);
+      saveDebug('lastClosedTaskProcessing', {
+        task_id: normalizedTaskId,
+        trigger,
+        status: 'completed',
+        result,
+      });
+    } catch (error) {
+      saveDebug('lastClosedTaskProcessing', {
+        task_id: normalizedTaskId,
+        trigger,
+        status: 'failed',
+        error: error.message,
+      });
+      saveDebug('lastError', {
+        task_id: normalizedTaskId,
+        stage: 'closed_task_background_processing',
+        error: error.message,
+      });
+      log('Closed task background processing failed', {
+        task_id: normalizedTaskId,
+        trigger,
+        error: error.message,
+      });
+    } finally {
+      closedTaskProcessingTaskIds.delete(normalizedTaskId);
+    }
+  }, 0);
+
+  return { queued: true, task_id: normalizedTaskId };
+}
+
 async function handleWebhook(body) {
   const data = parseFormUrlEncoded(body);
 
@@ -2239,9 +2327,8 @@ async function handleWebhook(body) {
 
   // Ветка 2: закрытие задачи, сбор контекста и вызов Геммы.
   if (shouldProcessClosedTask) {
-    await rememberClosedTaskTime(taskId);
-    const result = await processClosedTask(taskId);
-    actions.push({ branch: 'task_closed', trigger: closeTrigger, ...result });
+    const result = queueClosedTaskProcessing(taskId, closeTrigger);
+    actions.push({ branch: 'task_closed_queued', trigger: closeTrigger, ...result });
   }
 
   if (actions.length === 0) {
