@@ -30,7 +30,8 @@ const GEMMA_COMMENT_AUTHOR_ID = String(process.env.GEMMA_COMMENT_AUTHOR_ID || 20
 const AI_IMAGE_PROCESSING_ENABLED = true;
 const AI_MAX_IMAGES = 15;
 const AI_MAX_IMAGE_BYTES = 20 * 1024 * 1024;
-const AI_MAX_TOTAL_IMAGE_BYTES = 28 * 1024 * 1024;
+const AI_MAX_IMAGE_BATCH_BYTES = 18 * 1024 * 1024;
+const AI_MAX_IMAGES_PER_BATCH = 4;
 const AI_SUPPORTED_IMAGE_MIME_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const AUDIO_TRANSCRIPTION_MODEL = 'bitrix/deepdml/faster-whisper-large-v3-turbo-ct2';
 const AI_MAX_AUDIO_FILES = 10;
@@ -46,7 +47,9 @@ const debugState = {
   nextTaskTimeCheck: null,
   lastTaskTimeChatDecision: null,
   lastTaskTimeCheck: null,
+  lastTaskCloseDecision: null,
   lastTaskImages: null,
+  lastImageOcr: null,
   lastError: null,
 };
 
@@ -1012,25 +1015,52 @@ async function prepareTaskChatAudioTranscripts(task, scope) {
 function buildAiMessageContent(prompt, images) {
   if (!images.length) return prompt;
 
-  let totalImageBytes = 0;
-  const limitedImages = [];
-  for (const image of images) {
-    const base64 = String(image.dataUrl || '').split(',')[1] || '';
-    const imageBytes = Math.ceil(base64.length * 3 / 4);
-    if (totalImageBytes + imageBytes > AI_MAX_TOTAL_IMAGE_BYTES) break;
-    totalImageBytes += imageBytes;
-    limitedImages.push(image);
-  }
-
-  if (!limitedImages.length) return prompt;
-
   return [
     { type: 'text', text: prompt },
-    ...limitedImages.map(image => ({
+    ...images.map(image => ({
       type: 'image_url',
       image_url: { url: image.dataUrl },
     })),
   ];
+}
+
+function getImageBytes(image) {
+  if (Number.isFinite(image?.bytes) && image.bytes > 0) return image.bytes;
+
+  const base64 = String(image?.dataUrl || '').split(',')[1] || '';
+  return Math.ceil(base64.length * 3 / 4);
+}
+
+function buildImageBatches(images) {
+  const batches = [];
+  let batch = [];
+  let batchBytes = 0;
+
+  for (const image of images) {
+    const imageBytes = getImageBytes(image);
+    const batchWouldBeTooLarge = batchBytes + imageBytes > AI_MAX_IMAGE_BATCH_BYTES;
+    const batchWouldHaveTooManyImages = batch.length >= AI_MAX_IMAGES_PER_BATCH;
+
+    if (batch.length && (batchWouldBeTooLarge || batchWouldHaveTooManyImages)) {
+      batches.push(batch);
+      batch = [];
+      batchBytes = 0;
+    }
+
+    batch.push(image);
+    batchBytes += imageBytes;
+  }
+
+  if (batch.length) batches.push(batch);
+  return batches;
+}
+
+function getImageBatchMetadata(batch) {
+  return {
+    images_count: batch.length,
+    bytes: batch.reduce((sum, image) => sum + getImageBytes(image), 0),
+    images: getImageMetadata(batch),
+  };
 }
 
 function truncateDebugText(value, maxLength = 1500) {
@@ -1041,12 +1071,7 @@ function truncateDebugText(value, maxLength = 1500) {
 async function extractImageFacts(images, scope) {
   if (!images.length) return null;
 
-  try {
-    const response = await coworkRequest('POST', '/chat/completions', {
-      model: IMAGE_MODEL_NAME,
-      messages: [{
-        role: 'user',
-        content: buildAiMessageContent(`Ты анализируешь изображения, приложенные к задачам технической поддержки 1С.
+  const prompt = `Ты анализируешь изображения, приложенные к задачам технической поддержки 1С.
 Твоя задача — извлечь из изображения максимум достоверной информации для дальнейшего анализа задачи.
 
 Сначала выполни полный OCR:
@@ -1065,15 +1090,86 @@ async function extractImageFacts(images, scope) {
 Не объясняй причины.
 Не предлагай решение.
 Не делай выводов, которых нет на изображении.
-Если читаемый текст и факты невозможно определить, напиши: Не удалось определить.`, images),
-      }],
-    });
+Если читаемый текст и факты невозможно определить, напиши: Не удалось определить.`;
+  const batches = buildImageBatches(images);
+  const facts = [];
+  const debugBatches = batches.map((batch, index) => ({
+    batch: index + 1,
+    status: 'pending',
+    ...getImageBatchMetadata(batch),
+  }));
 
-    return normalizeAiContent(response?.choices?.[0]?.message?.content) || null;
-  } catch (error) {
-    log('Image facts extraction failed', { scope, error: error.message });
-    return null;
+  saveDebug('lastImageOcr', {
+    scope,
+    status: 'started',
+    image_model: IMAGE_MODEL_NAME,
+    images_count: images.length,
+    batches_count: batches.length,
+    max_batch_bytes: AI_MAX_IMAGE_BATCH_BYTES,
+    max_images_per_batch: AI_MAX_IMAGES_PER_BATCH,
+    batches: debugBatches,
+  });
+
+  for (const [index, batch] of batches.entries()) {
+    try {
+      debugBatches[index].status = 'running';
+      saveDebug('lastImageOcr', {
+        scope,
+        status: 'running',
+        image_model: IMAGE_MODEL_NAME,
+        images_count: images.length,
+        batches_count: batches.length,
+        current_batch: index + 1,
+        batches: debugBatches,
+      });
+
+      const response = await coworkRequest('POST', '/chat/completions', {
+        model: IMAGE_MODEL_NAME,
+        messages: [{
+          role: 'user',
+          content: buildAiMessageContent(prompt, batch),
+        }],
+      });
+
+      const text = normalizeAiContent(response?.choices?.[0]?.message?.content) || null;
+      debugBatches[index].status = text ? 'ok' : 'empty';
+      debugBatches[index].facts_preview = truncateDebugText(text, 500);
+      if (text) facts.push(`Партия изображений ${index + 1}:\n${text}`);
+    } catch (error) {
+      debugBatches[index].status = 'failed';
+      debugBatches[index].error = error.message;
+      log('Image OCR batch failed', {
+        scope,
+        batch: index + 1,
+        images: batch.length,
+        bytes: debugBatches[index].bytes,
+        error: error.message,
+      });
+    }
+
+    saveDebug('lastImageOcr', {
+      scope,
+      status: 'running',
+      image_model: IMAGE_MODEL_NAME,
+      images_count: images.length,
+      batches_count: batches.length,
+      current_batch: index + 1,
+      facts_found: facts.length,
+      batches: debugBatches,
+    });
   }
+
+  saveDebug('lastImageOcr', {
+    scope,
+    status: facts.length ? 'ok' : 'empty',
+    image_model: IMAGE_MODEL_NAME,
+    images_count: images.length,
+    batches_count: batches.length,
+    facts_found: facts.length,
+    batches: debugBatches,
+  });
+
+  return facts.length ? facts.join('\n\n') : null;
 }
 
 function normalizeTimePayload(response) {
@@ -1555,16 +1651,24 @@ function getHistoryBatchNearWebhook(history, webhookTimestampMs) {
   return nearbyHistory.filter(item => Math.abs(latestNearbyChange.createdAtMs - item.createdAtMs) <= 500);
 }
 
-async function getLatestUpdateBatch(taskId, webhookTimestampMs = null) {
+async function getLatestUpdateContext(taskId, webhookTimestampMs = null) {
   const sortedHistory = await getTaskHistory(taskId);
   const webhookBatch = getHistoryBatchNearWebhook(sortedHistory, webhookTimestampMs);
-  if (webhookBatch.length > 0) return webhookBatch;
+  if (webhookBatch.length > 0) return { history: sortedHistory, batch: webhookBatch };
 
-  if (Number.isFinite(webhookTimestampMs)) return [];
+  if (Number.isFinite(webhookTimestampMs)) return { history: sortedHistory, batch: [] };
 
   const latestChange = sortedHistory[0];
-  if (!latestChange) return [];
-  return sortedHistory.filter(item => latestChange.createdAtMs - item.createdAtMs <= 2000);
+  if (!latestChange) return { history: sortedHistory, batch: [] };
+  return {
+    history: sortedHistory,
+    batch: sortedHistory.filter(item => latestChange.createdAtMs - item.createdAtMs <= 2000),
+  };
+}
+
+async function getLatestUpdateBatch(taskId, webhookTimestampMs = null) {
+  const context = await getLatestUpdateContext(taskId, webhookTimestampMs);
+  return context.batch;
 }
 
 function isInsufficientInfoComment(comment) {
@@ -1587,6 +1691,26 @@ function extractSummaryFromAiComment(comment) {
 
 function isSummaryOnlyGroup(groupId) {
   return String(groupId || '') === '276';
+}
+
+function isDoneStageChange(change) {
+  return normalizeHistoryField(change?.field) === 'STAGE' && String(change?.value?.to || '').trim() === 'Сделаны';
+}
+
+function isStatusClosedChange(change) {
+  return normalizeHistoryField(change?.field) === 'STATUS' && String(change?.value?.to) === '5';
+}
+
+function findClosedStatusChangeNearDoneStage(history, doneStageChange) {
+  if (!doneStageChange || !Number.isFinite(doneStageChange.createdAtMs)) return null;
+
+  const stageTimeMs = doneStageChange.createdAtMs;
+  return history.find(change =>
+    isStatusClosedChange(change) &&
+    Number.isFinite(change.createdAtMs) &&
+    change.createdAtMs >= stageTimeMs - 1000 &&
+    change.createdAtMs <= stageTimeMs
+  ) || null;
 }
 
 function normalizeAiContent(content) {
@@ -1732,7 +1856,7 @@ ${JSON.stringify(contextparentID, null, 2)}
 3. Точный элемент конфигурации, связанный с причиной проблемы, если он подтвержден исходными данными.
 4. Условия возникновения проблемы, если указаны.
 5. Точные выполненные действия: что именно проверено, изменено, добавлено, удалено, настроено или разработано и в каком объекте.
-6. Подтвержденный результат выполненных работ.
+6. Подтвержденный результат выполненных работ, если не удалось связаться с заказчиком или он не отвечает, это тоже результат в случае отсутствия других работ.
 При формировании SUMMARY сохрани все извлеченные технические наименования, которые необходимы для понимания причины и выполненных работ.
 
 ЗАДАНИЕ:
@@ -1751,6 +1875,7 @@ ${JSON.stringify(contextparentID, null, 2)}
 - Выведи только один вариант TITLE.
 - TITLE должен быть максимально точным и полным, но без лишних деталей.
 - TITLE должен содержать от 3 до 25 слов.
+- Если в JSON указано конкретное название объекта, организации, обособленного подразделения, сотрудника, пользователя, базы, отчета, документа, обработки, настройки или другого предмета работ, используй это конкретное название в TITLE вместо родового обозначения.
 - Если задача является консультацией, начни TITLE со слов "Консультация по...".
 - Если в задаче выполнены работы, настройка, исправление, разработка, подключение, обновление или проверка, начни TITLE со слов "Проведение работ по...".
 - Если задача содержит одновременно:одтвержденную проблему и подтвержденное решение,то TITLE формируется по схеме: <Проблема>. Решение: <способ устранения>.
@@ -1773,6 +1898,7 @@ ${JSON.stringify(contextparentID, null, 2)}
 Проверка достаточности информации:
 - Перед формированием результата оцени, достаточно ли информации для понимания проблемы и выполненных работ.
 - Если из JSON задачи и базовой задачи невозможно определить, в чем заключалась проблема или какие действия были выполнены, не пытайся делать предположения и не придумывай содержание.
+- Если из JSON видно, что клиент задал запрос, а сотрудники пытались связаться или уточнить детали, но клиент не ответил, это не считается недостатком информации. В SUMMARY укажи исходный запрос клиента и факт попыток связи; результат: задача закрыта из-за отсутствия обратной связи.
 - В этом случае не выводи разделы ✅ SUMMARY и 📝 TITLE.
 - Вместо них выведи только следующую строку: INSUFFICIENT_INFORMATION
 - Не добавляй никаких других комментариев или пояснений.
@@ -2071,11 +2197,13 @@ async function handleWebhook(body) {
   }
 
   const webhookTimestampMs = getWebhookTimestampMs(data);
-  const updateBatch = await getLatestUpdateBatch(taskId, webhookTimestampMs);
+  const updateContext = await getLatestUpdateContext(taskId, webhookTimestampMs);
+  const updateBatch = updateContext.batch;
   const primaryChange = updateBatch[0] || null;
   const primaryField = normalizeHistoryField(primaryChange?.field);
   const responsibleChange = primaryField === normalizeHistoryField('RESPONSIBLE_ID') ? primaryChange : null;
   const statusChange = primaryField === normalizeHistoryField('STATUS') ? primaryChange : null;
+  const doneStageChange = isDoneStageChange(primaryChange) ? primaryChange : null;
   const actions = [];
 
   // Ветка 1: изменение ответственного, добавление прошлого исполнителя в соисполнители.
@@ -2085,11 +2213,35 @@ async function handleWebhook(body) {
     actions.push({ branch: 'responsible_changed', ...result });
   }
 
+  let shouldProcessClosedTask = String(statusChange?.value?.to) === '5';
+  let closeTrigger = shouldProcessClosedTask ? 'status_to_5' : null;
+  let statusChangeNearDoneStage = null;
+
+  if (!shouldProcessClosedTask && doneStageChange) {
+    statusChangeNearDoneStage = findClosedStatusChangeNearDoneStage(updateContext.history, doneStageChange);
+    shouldProcessClosedTask = Boolean(statusChangeNearDoneStage);
+    closeTrigger = shouldProcessClosedTask ? 'done_stage_with_recent_status_to_5' : null;
+  }
+
+  saveDebug('lastTaskCloseDecision', {
+    task_id: taskId,
+    webhook_ts: data.ts || null,
+    primary_field: primaryChange?.field || null,
+    primary_value: primaryChange?.value || null,
+    latest_fields: updateBatch.map(item => item.field),
+    status_change_to: statusChange?.value?.to || null,
+    done_stage_change: Boolean(doneStageChange),
+    status_change_near_done_stage_id: statusChangeNearDoneStage?.id || null,
+    status_change_near_done_stage_at: statusChangeNearDoneStage?.createdDate || null,
+    should_process_closed_task: shouldProcessClosedTask,
+    close_trigger: closeTrigger,
+  });
+
   // Ветка 2: закрытие задачи, сбор контекста и вызов Геммы.
-  if (String(statusChange?.value?.to) === '5') {
+  if (shouldProcessClosedTask) {
     await rememberClosedTaskTime(taskId);
     const result = await processClosedTask(taskId);
-    actions.push({ branch: 'task_closed', ...result });
+    actions.push({ branch: 'task_closed', trigger: closeTrigger, ...result });
   }
 
   if (actions.length === 0) {
