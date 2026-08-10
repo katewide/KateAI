@@ -26,7 +26,7 @@ const TASK_TIME_ALERT_RETENTION_DAYS = Number(process.env.TASK_TIME_ALERT_RETENT
 const API_REQUEST_TIMEOUT_MS = Number(process.env.API_REQUEST_TIMEOUT_MS || 60 * 1000);
 const AI_OCR_REQUEST_TIMEOUT_MS = Number(process.env.AI_OCR_REQUEST_TIMEOUT_MS || 30 * 1000);
 const MSK_UTC_OFFSET_HOURS = 3;
-const GEMMA_EXCLUDED_GROUP_IDS = new Set(['12', '92', '376', '490']);
+const GEMMA_EXCLUDED_GROUP_IDS = new Set(['12', '58', '92', '140', '376', '490']);
 const GEMMA_COMMENT_AUTHOR_ID = String(process.env.GEMMA_COMMENT_AUTHOR_ID || 204);
 const AI_IMAGE_PROCESSING_ENABLED = true;
 const AI_MAX_IMAGES = 15;
@@ -50,6 +50,7 @@ const debugState = {
   lastTaskTimeCheck: null,
   lastTaskCloseDecision: null,
   lastClosedTaskProcessing: null,
+  lastOpenTaskNextStep: null,
   lastTaskImages: null,
   lastImageOcr: null,
   lastError: null,
@@ -1981,6 +1982,49 @@ ${JSON.stringify(contextparentID, null, 2)}
 Если информации недостаточно, вместо SUMMARY и TITLE выведи только: INSUFFICIENT_INFORMATION`;
 }
 
+function buildNextStepPrompt({ taskId, groupId, responsibleId, creatorId, task, comments, timeLogs, history, images, imageFacts, audioTranscripts }) {
+  const context = {
+    currentDate: new Date().toISOString(),
+    currentTaskId: taskId,
+    groupId,
+    responsibleId,
+    creatorId,
+    task,
+    comments,
+    timeLogs,
+    timeSpentInLogs: getTaskTimeSpent(task),
+    durationFact: getTaskDurationFact(task),
+    history,
+    images: getImageMetadata(images),
+    imageFacts,
+    audioTranscripts,
+  };
+
+  return `Ты - профессиональный консультант 1С и координатор поддержки. Твоя задача — проанализировать незакрытую задачу и предложить следующий шаг, а не итог выполненных работ.
+
+НИЖЕ ПРИВЕДЕН КОНТЕКСТ ЗАДАЧИ (JSON):
+${JSON.stringify(context, null, 2)}
+
+ПРАВИЛА АНАЛИЗА:
+- Используй только факты из JSON.
+- Не придумывай выполненные работы, договоренности, причины и сроки, если они прямо не подтверждены.
+- Учитывай описание задачи, комментарии, историю изменений, трудозатраты, OCR изображений и расшифровки аудио.
+- Комментарии и история последних действий важнее исходного описания задачи.
+- Если последняя активность по задаче была более 14 дней назад, выбери статус "⚪ Нет активности", даже если по смыслу задача могла ожидать ответа одной из сторон.
+- Если из JSON видно, что ЭЛРОС написал клиенту, передал результат, задал уточняющий вопрос или ожидает подтверждения от заказчика, выбери статус "🟢 Ждет ответа заказчика".
+- Если из JSON видно, что задача находится на стороне ЭЛРОС, нет подтвержденного ответа/результата для клиента, требуется актуализировать срок, проверить состояние или продолжить работу, выбери статус "🔵 Ждет ответа от ЭЛРОС".
+- Если невозможно уверенно определить сторону ожидания, выбери наиболее осторожный статус и объясни, какого факта не хватает.
+
+ФОРМАТ ОТВЕТА:
+[b]СТАТУС:[/b] <ровно один статус из списка: 🟢 Ждет ответа заказчика / 🔵 Ждет ответа от ЭЛРОС / ⚪ Нет активности>
+
+[b]СЛЕДУЮЩИЙ ШАГ:[/b]
+<1-2 предложения: что нужно сделать дальше>
+
+[b]ОБОСНОВАНИЕ:[/b]
+<1-3 предложения: какие факты из JSON подтверждают выбранный статус>`;
+}
+
 async function processClosedTask(taskId, options = {}) {
   const dryRun = Boolean(options.dryRun);
   const { task: mainTask, comments: mainComments, commentsSource } = await fetchTaskWithComments(taskId);
@@ -2240,6 +2284,122 @@ async function processClosedTask(taskId, options = {}) {
   };
 }
 
+async function processOpenTaskNextStep(taskId) {
+  saveDebug('lastOpenTaskNextStep', {
+    task_id: taskId,
+    status: 'started',
+  });
+
+  const { task, comments, commentsSource } = await fetchTaskWithComments(taskId);
+  const filteredComments = filterGemmaComments(comments);
+  const groupId = getGroupIdFromTask(task);
+  const groupName = getGroupNameFromTask(task);
+  const responsibleId = getResponsibleIdFromTask(task);
+  const creatorId = getCreatorIdFromTask(task);
+  const timeLogs = await fetchTaskTimeLogs(taskId);
+  const history = await getTaskHistory(taskId);
+
+  if (isTaskClosed(task)) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'task_is_closed',
+      task_id: taskId,
+      status: getStatusFromTask(task),
+    };
+  }
+
+  const imageResult = await prepareTaskImages(task, filteredComments, 'openTask');
+  const chatImageResult = await prepareTaskChatImages(task, 'openTask');
+  const images = [...imageResult.images, ...chatImageResult.images].slice(0, AI_MAX_IMAGES);
+
+  saveDebug('lastOpenTaskNextStep', {
+    task_id: taskId,
+    status: 'images_downloaded_before_ocr',
+    comments_source: commentsSource,
+    group_id: groupId || null,
+    group_name: groupName || null,
+    task_status: getStatusFromTask(task),
+    image_candidates_count: imageResult.candidatesCount + chatImageResult.candidatesCount,
+    images_count: images.length,
+    images: getImageMetadata(images),
+  });
+
+  const imageFacts = await extractImageFacts(images, 'незакрытой задачи', taskId);
+  const audioResult = await prepareTaskChatAudioTranscripts(task, 'openTask');
+
+  saveDebug('lastOpenTaskNextStep', {
+    task_id: taskId,
+    status: 'summary_started',
+    comments_source: commentsSource,
+    group_id: groupId || null,
+    group_name: groupName || null,
+    task_status: getStatusFromTask(task),
+    comments_count: filteredComments.length,
+    time_logs_count: timeLogs.length,
+    history_count: history.length,
+    image_candidates_count: imageResult.candidatesCount + chatImageResult.candidatesCount,
+    images_count: images.length,
+    image_facts_found: Boolean(imageFacts),
+    audio_candidates_count: audioResult.candidatesCount,
+    audio_transcripts_count: audioResult.transcripts.length,
+  });
+
+  const prompt = buildNextStepPrompt({
+    taskId,
+    groupId,
+    responsibleId,
+    creatorId,
+    task,
+    comments: filteredComments,
+    timeLogs,
+    history,
+    images,
+    imageFacts,
+    audioTranscripts: audioResult.transcripts,
+  });
+
+  const aiResponse = await coworkRequest('POST', '/chat/completions', {
+    model: SUMMARY_MODEL_NAME,
+    messages: [{
+      role: 'user',
+      content: prompt,
+    }],
+  });
+  const aiComment = normalizeAiContent(aiResponse?.choices?.[0]?.message?.content);
+  if (!aiComment) throw new Error('AI model returned empty next step');
+
+  const result = {
+    ok: true,
+    task_id: taskId,
+    group_id: groupId || null,
+    group_name: groupName || null,
+    task_status: getStatusFromTask(task),
+    responsible_id: responsibleId,
+    creator_id: creatorId,
+    comments_source: commentsSource,
+    summary_model: SUMMARY_MODEL_NAME,
+    image_model: IMAGE_MODEL_NAME,
+    time_spent_in_logs: getTaskTimeSpent(task),
+    time_logs_count: timeLogs.length,
+    history_count: history.length,
+    ai_images_count: images.length,
+    image_facts_found: Boolean(imageFacts),
+    audio_candidates_count: audioResult.candidatesCount,
+    audio_transcripts_count: audioResult.transcripts.length,
+    raw_ai_comment: aiComment,
+    ai_comment: aiComment,
+  };
+
+  saveDebug('lastOpenTaskNextStep', {
+    task_id: taskId,
+    status: 'completed',
+    ...result,
+  });
+
+  return result;
+}
+
 function queueClosedTaskProcessing(taskId, trigger) {
   const normalizedTaskId = String(taskId);
 
@@ -2395,7 +2555,7 @@ function sendAiTestPage(res) {
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 24px; color: #1f2937; background: #f6f7f9; }
     main { max-width: 1100px; margin: 0 auto; }
-    form { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; }
+    form { display: flex; gap: 8px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
     input { font-size: 16px; padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 6px; width: 160px; }
     button { font-size: 16px; padding: 9px 14px; border: 0; border-radius: 6px; background: #2563eb; color: white; cursor: pointer; }
     button:disabled { opacity: .65; cursor: default; }
@@ -2411,11 +2571,16 @@ function sendAiTestPage(res) {
 <body>
   <main>
     <h1>AI preview</h1>
-    <form id="form">
-      <input id="taskId" name="taskId" value="184538" inputmode="numeric">
-      <button id="run" type="submit">Запустить</button>
-      <span id="status" class="muted"></span>
-    </form>
+	    <form id="form">
+	      <input id="taskId" name="taskId" value="184538" inputmode="numeric">
+	      <button id="run" type="submit">Итог закрытой задачи</button>
+	      <span id="status" class="muted"></span>
+	    </form>
+	    <form id="openTaskForm">
+	      <input id="openTaskId" name="openTaskId" value="184538" inputmode="numeric">
+	      <button id="runOpenTask" type="submit">Следующий шаг</button>
+	      <span id="openTaskStatus" class="muted"></span>
+	    </form>
     <div class="grid">
       <section>
         <h2>Что было бы опубликовано</h2>
@@ -2442,14 +2607,17 @@ function sendAiTestPage(res) {
       }
     }
 
-    const form = document.getElementById('form');
-    const run = document.getElementById('run');
-    const status = document.getElementById('status');
-    const final = document.getElementById('final');
+	    const form = document.getElementById('form');
+	    const openTaskForm = document.getElementById('openTaskForm');
+	    const run = document.getElementById('run');
+	    const runOpenTask = document.getElementById('runOpenTask');
+	    const status = document.getElementById('status');
+	    const openTaskStatus = document.getElementById('openTaskStatus');
+	    const final = document.getElementById('final');
     const raw = document.getElementById('raw');
     const details = document.getElementById('details');
 
-    form.addEventListener('submit', async (event) => {
+	    form.addEventListener('submit', async (event) => {
       event.preventDefault();
       run.disabled = true;
       status.textContent = 'Анализирую...';
@@ -2486,8 +2654,48 @@ function sendAiTestPage(res) {
       } finally {
         run.disabled = false;
       }
-    });
-  </script>
+	    });
+
+	    openTaskForm.addEventListener('submit', async (event) => {
+	      event.preventDefault();
+	      runOpenTask.disabled = true;
+	      openTaskStatus.textContent = 'Анализирую...';
+	      final.textContent = '';
+	      raw.textContent = '';
+	      details.textContent = '';
+	      final.className = '';
+
+	      try {
+	        const taskId = document.getElementById('openTaskId').value.trim();
+	        const response = await fetch('/ai-next-step-preview?taskId=' + encodeURIComponent(taskId));
+	        const data = await response.json();
+	        if (!response.ok || !data.ok) throw new Error(renderValue(data.error || data));
+
+	        final.textContent = renderValue(data.ai_comment);
+	        raw.textContent = renderValue(data.raw_ai_comment);
+	        details.textContent = JSON.stringify({
+	          task_id: data.task_id,
+	          group_id: data.group_id,
+	          task_status: data.task_status,
+	          summary_model: data.summary_model,
+	          time_spent_in_logs: data.time_spent_in_logs,
+	          time_logs_count: data.time_logs_count,
+	          history_count: data.history_count,
+	          ai_images_count: data.ai_images_count,
+	          image_facts_found: data.image_facts_found,
+	          audio_candidates_count: data.audio_candidates_count,
+	          audio_transcripts_count: data.audio_transcripts_count,
+	        }, null, 2);
+	        openTaskStatus.textContent = 'Готово';
+	      } catch (error) {
+	        openTaskStatus.textContent = 'Ошибка';
+	        final.textContent = renderValue(error.message || error);
+	        final.className = 'error';
+	      } finally {
+	        runOpenTask.disabled = false;
+	      }
+	    });
+	  </script>
 </body>
 </html>`);
 }
@@ -2577,6 +2785,23 @@ const server = http.createServer(async (req, res) => {
 
       const result = await processClosedTask(taskId, { dryRun: true });
       sendJson(res, 200, result);
+      return;
+    }
+
+    if ((req.method === 'GET' || req.method === 'HEAD') && pathname === '/ai-next-step-preview') {
+      const taskId = new URL(req.url, `http://${req.headers.host || 'localhost'}`).searchParams.get('taskId') || '184538';
+      if (!normalizeId(taskId)) {
+        sendJson(res, 400, { ok: false, error: 'Invalid taskId' });
+        return;
+      }
+
+      if (req.method === 'HEAD') {
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      const result = await processOpenTaskNextStep(taskId);
+      sendJson(res, result.ok ? 200 : 400, result);
       return;
     }
 
