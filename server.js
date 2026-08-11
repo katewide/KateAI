@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'open-task-watch-debug-2026-08-12-01';
+const APP_VERSION = 'open-task-watch-stateless-2026-08-12-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -3227,7 +3227,8 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
 
   const context = await collectOpenTaskWatchContext(taskId);
   if (context.skipped) {
-    await markOpenTaskWatchResolved(taskId, context.reason);
+    // Тестово отключено: открытая ветка больше не ведет состояние проверки в базе.
+    // await markOpenTaskWatchResolved(taskId, context.reason);
     return { task_id: taskId, skipped: true, reason: context.reason };
   }
 
@@ -3284,13 +3285,25 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
   const aiResult = normalizeOpenTaskAiResult(parseAiJsonObject(rawAiResult));
   const alertStatus = aiResult.needs_attention ? getOpenTaskAlertStatus(aiResult) : null;
   const nextRecheckAt = getNextRecheckAt(aiResult.recheck_days);
-  const saved = await saveOpenTaskWatchState({
-    task: context.task,
-    groupId: context.groupId || candidateInfo.groupId,
-    groupName: context.groupName || candidateInfo.groupName,
-    aiResult,
-    nextRecheckAt,
-  });
+  // Тестово отключено: каждый ручной запуск собирает свежие сведения и не опирается на сохраненную историю проверок.
+  // const saved = await saveOpenTaskWatchState({
+  //   task: context.task,
+  //   groupId: context.groupId || candidateInfo.groupId,
+  //   groupName: context.groupName || candidateInfo.groupName,
+  //   aiResult,
+  //   nextRecheckAt,
+  // });
+
+  const responsibleId = getResponsibleIdFromTask(context.task);
+  const responsibleName = await getUserNameById(responsibleId);
+  const saved = {
+    task_id: taskId,
+    responsible_id: responsibleId,
+    responsible_name: responsibleName || (responsibleId ? `Пользователь ${responsibleId}` : UNKNOWN_USER_NAME),
+    group_id: context.groupId || candidateInfo.groupId,
+    group_name: context.groupName || candidateInfo.groupName,
+    task_link: buildTaskLink(context.task),
+  };
 
   const result = {
     ok: true,
@@ -3366,8 +3379,9 @@ async function sendOpenTaskWatchReport(alerts) {
   await coworkRequest('POST', `/chats/${ELAPSED_NOTIFICATION_CHAT_ID}/messages`, { message });
 
   for (const alert of alerts) {
-    await saveOpenTaskWatchAlert(alert);
-    await markOpenTaskWatchAlertSent(alert.task_id, alert.alert_status);
+    // Тестово отключено: открытая ветка не пишет историю ручных проверок в базу.
+    // await saveOpenTaskWatchAlert(alert);
+    // await markOpenTaskWatchAlertSent(alert.task_id, alert.alert_status);
   }
 
   saveDebug('lastOpenTaskWatchChatDecision', {
@@ -3474,7 +3488,9 @@ async function runOpenTaskWatchCheck(options = {}) {
     }
 
     openTaskCheckStage = 'resolve_existing_states';
-    const resolvedStates = await resolveOpenTaskWatchStates(candidateInfos.map(info => info.taskId));
+    // Тестово отключено: не сверяемся с сохраненным состоянием, каждый запрос работает по актуальному списку из API.
+    // const resolvedStates = await resolveOpenTaskWatchStates(candidateInfos.map(info => info.taskId));
+    const resolvedStates = 0;
 
     openTaskCheckStage = 'select_due_tasks';
     const dueInfos = [];
@@ -3494,8 +3510,10 @@ async function runOpenTaskWatchCheck(options = {}) {
       //   continue;
       // }
 
-      const state = await getOpenTaskWatchState(info.taskId);
-      if (isOpenTaskWatchDue(state)) dueInfos.push(info);
+      // Тестово отключено: last_recheck_at/resolved_at больше не ограничивают ручную проверку.
+      // const state = await getOpenTaskWatchState(info.taskId);
+      // if (isOpenTaskWatchDue(state)) dueInfos.push(info);
+      dueInfos.push(info);
     }
 
     const selectedInfos = dueInfos.slice(0, maxToAnalyze);
