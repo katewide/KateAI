@@ -2758,7 +2758,6 @@ function buildOpenTaskListQuery(offset) {
   params.set('offset', String(offset));
   params.set('sort', 'id');
   params.set('filter[status]', '2');
-  params.set('filter[createdDate][$lte]', getIsoDaysAgo(OPEN_TASK_MIN_AGE_DAYS));
   params.set('select', [
     'id',
     'title',
@@ -2774,6 +2773,12 @@ function buildOpenTaskListQuery(offset) {
     'durationFact',
   ].join(','));
   return params.toString();
+}
+
+function isOpenTaskOldEnough(task) {
+  const createdAtMs = Date.parse(getTaskCreatedDate(task));
+  if (!Number.isFinite(createdAtMs)) return false;
+  return createdAtMs <= Date.parse(getIsoDaysAgo(OPEN_TASK_MIN_AGE_DAYS));
 }
 
 async function fetchOpenTaskWatchCandidates() {
@@ -2796,7 +2801,18 @@ async function fetchOpenTaskWatchCandidates() {
     if (!hasMore || pageTasks.length === 0) break;
   }
 
-  return tasks.filter(task => getStatusFromTask(task) === '2');
+  const openTasks = tasks.filter(task => getStatusFromTask(task) === '2');
+  const oldEnoughTasks = openTasks.filter(isOpenTaskOldEnough);
+
+  saveDebug('lastOpenTaskWatchCheck', {
+    status: 'open_tasks_fetched',
+    raw_tasks_from_api: tasks.length,
+    status_2_tasks: openTasks.length,
+    old_enough_tasks: oldEnoughTasks.length,
+    min_age_days: OPEN_TASK_MIN_AGE_DAYS,
+  });
+
+  return oldEnoughTasks;
 }
 
 async function getOpenTaskCandidateInfo(task) {
@@ -2814,11 +2830,48 @@ async function getOpenTaskCandidateInfo(task) {
     archived = isWorkgroupArchived(workgroup);
   }
 
+  if (!groupName) {
+    try {
+      const taskResponse = await coworkRequest('GET', `/tasks/${encodeURIComponent(taskId)}`);
+      const fullTask = normalizeTaskPayload(taskResponse);
+      groupName = getGroupNameFromTask(fullTask);
+      archived = getGroupArchivedFromTask(fullTask);
+      task = fullTask || task;
+    } catch (error) {
+      log('Open task full task fetch for group name failed', {
+        task_id: taskId,
+        group_id: groupId,
+        error: error.message,
+      });
+    }
+  }
+
   if (!groupName) return { task, taskId, included: false, reason: 'group_name_not_found', groupId };
   if (isCollabGroupName(groupName)) return { task, taskId, included: false, reason: 'collab_group_name', groupId, groupName };
   if (archived) return { task, taskId, included: false, reason: 'archived_group', groupId, groupName };
 
   return { task, taskId, included: true, groupId, groupName };
+}
+
+async function checkOpenTaskWatchEligibility(taskId) {
+  const response = await coworkRequest('GET', `/tasks/${encodeURIComponent(taskId)}`);
+  const task = normalizeTaskPayload(response);
+  const info = await getOpenTaskCandidateInfo(task);
+
+  return {
+    ok: true,
+    task_id: String(taskId),
+    status: getStatusFromTask(task),
+    created_date: getTaskCreatedDate(task),
+    min_age_days: OPEN_TASK_MIN_AGE_DAYS,
+    old_enough: isOpenTaskOldEnough(task),
+    group_id: getGroupIdFromTask(task),
+    group_name: getGroupNameFromTask(task) || info.groupName || null,
+    group_archived: getGroupArchivedFromTask(task),
+    included_by_group_filters: info.included,
+    group_filter_skip_reason: info.included ? null : info.reason,
+    would_be_candidate: getStatusFromTask(task) === '2' && isOpenTaskOldEnough(task) && info.included,
+  };
 }
 
 async function getOpenTaskWatchState(taskId) {
@@ -2975,6 +3028,26 @@ function isOpenTaskWatchDue(state, now = new Date()) {
   if (state.resolved_at) return false;
   if (!state.last_recheck_at) return true;
   return Date.parse(state.last_recheck_at) <= now.getTime();
+}
+
+function incrementOpenTaskGroupCount(counts, taskOrInfo) {
+  const groupId = taskOrInfo.groupId || getGroupIdFromTask(taskOrInfo.task || taskOrInfo) || 'NO_GROUP';
+  const groupName = taskOrInfo.groupName || getGroupNameFromTask(taskOrInfo.task || taskOrInfo) || null;
+  const key = String(groupId);
+
+  counts[key] ||= {
+    group_id: key === 'NO_GROUP' ? null : key,
+    group_name: groupName,
+    count: 0,
+    excluded: isOpenTaskExcludedGroupId(key),
+  };
+
+  counts[key].count += 1;
+  if (!counts[key].group_name && groupName) counts[key].group_name = groupName;
+}
+
+function sortOpenTaskGroupCounts(counts) {
+  return Object.values(counts).sort((a, b) => b.count - a.count);
 }
 
 async function collectOpenTaskWatchContext(taskId) {
@@ -3267,11 +3340,28 @@ async function runOpenTaskWatchCheck(options = {}) {
     openTaskCheckStage = 'filter_candidates';
     const candidateInfos = [];
     const skippedByReason = {};
+    const skippedExamplesByReason = {};
+    const rawGroupCounts = {};
+    const candidateGroupCounts = {};
 
     for (const task of rawTasks) {
+      incrementOpenTaskGroupCount(rawGroupCounts, task);
       const info = await getOpenTaskCandidateInfo(task);
-      if (info.included) candidateInfos.push(info);
-      else skippedByReason[info.reason] = (skippedByReason[info.reason] || 0) + 1;
+      if (info.included) {
+        candidateInfos.push(info);
+        incrementOpenTaskGroupCount(candidateGroupCounts, info);
+      }
+      else {
+        skippedByReason[info.reason] = (skippedByReason[info.reason] || 0) + 1;
+        skippedExamplesByReason[info.reason] ||= [];
+        if (skippedExamplesByReason[info.reason].length < 10) {
+          skippedExamplesByReason[info.reason].push({
+            task_id: info.taskId || String(task?.id || task?.ID || ''),
+            group_id: info.groupId || getGroupIdFromTask(task) || null,
+            group_name: info.groupName || getGroupNameFromTask(task) || null,
+          });
+        }
+      }
     }
 
     openTaskCheckStage = 'resolve_existing_states';
@@ -3322,7 +3412,7 @@ async function runOpenTaskWatchCheck(options = {}) {
     const result = {
       ok: true,
       limit: maxToAnalyze,
-      raw_open_tasks: rawTasks.length,
+      old_enough_open_tasks: rawTasks.length,
       candidates: candidateInfos.length,
       due_tasks: dueInfos.length,
       analyzed_tasks: analyzed.length,
@@ -3330,6 +3420,9 @@ async function runOpenTaskWatchCheck(options = {}) {
       failed_tasks: failed.length,
       resolved_states: resolvedStates,
       skipped_by_reason: skippedByReason,
+      skipped_examples_by_reason: skippedExamplesByReason,
+      raw_group_counts: sortOpenTaskGroupCounts(rawGroupCounts),
+      candidate_group_counts: sortOpenTaskGroupCounts(candidateGroupCounts),
       message_sent: Boolean(message),
       chat_id: ELAPSED_NOTIFICATION_CHAT_ID,
       analyzed,
@@ -3811,6 +3904,23 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         ...result,
       });
+      return;
+    }
+
+    if ((req.method === 'GET' || req.method === 'HEAD') && pathname === '/open-task-eligibility') {
+      const taskId = new URL(req.url, `http://${req.headers.host || 'localhost'}`).searchParams.get('taskId');
+      if (!normalizeId(taskId)) {
+        sendJson(res, 400, { ok: false, error: 'Invalid taskId' });
+        return;
+      }
+
+      if (req.method === 'HEAD') {
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      const result = await checkOpenTaskWatchEligibility(taskId);
+      sendJson(res, 200, result);
       return;
     }
 
