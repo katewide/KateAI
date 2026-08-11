@@ -121,7 +121,7 @@ function getStorageDebugInfo() {
   return {
     data_dir: DATA_DIR,
     db_path: DB_PATH,
-    db_dir,
+    db_dir: dbDir,
     data_dir_exists: fs.existsSync(DATA_DIR),
     db_dir_exists: fs.existsSync(dbDir),
     data_dir_writable: fs.existsSync(DATA_DIR) ? checkPathWritable(DATA_DIR) : false,
