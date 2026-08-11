@@ -3153,15 +3153,16 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
     return { task_id: taskId, skipped: true, reason: context.reason };
   }
 
-  if (isCollabGroupName(context.groupName)) {
-    return {
-      task_id: taskId,
-      skipped: true,
-      reason: 'collab_group_name',
-      group_id: context.groupId || candidateInfo.groupId || null,
-      group_name: context.groupName || candidateInfo.groupName || null,
-    };
-  }
+  // Тестово отключено: проверяем открытую ветку без отсева групп по названию.
+  // if (isCollabGroupName(context.groupName)) {
+  //   return {
+  //     task_id: taskId,
+  //     skipped: true,
+  //     reason: 'collab_group_name',
+  //     group_id: context.groupId || candidateInfo.groupId || null,
+  //     group_name: context.groupName || candidateInfo.groupName || null,
+  //   };
+  // }
 
   rememberTaskUserNames(context.task);
   const prompt = buildOpenTaskWatchPrompt({
@@ -3333,9 +3334,10 @@ async function resolveOpenTaskWatchStates(candidateIds) {
       } else if (isOpenTaskExcludedGroupId(groupId)) {
         await markOpenTaskWatchResolved(state.task_id, 'excluded_group_id');
         resolved += 1;
-      } else if (groupName && isCollabGroupName(groupName)) {
-        await markOpenTaskWatchResolved(state.task_id, 'collab_group_name');
-        resolved += 1;
+      // Тестово отключено: проверяем открытую ветку без отсева групп по названию.
+      // } else if (groupName && isCollabGroupName(groupName)) {
+      //   await markOpenTaskWatchResolved(state.task_id, 'collab_group_name');
+      //   resolved += 1;
       }
     } catch (error) {
       log('Open task watch resolve check failed', { task_id: state.task_id, error: error.message });
@@ -3399,19 +3401,20 @@ async function runOpenTaskWatchCheck(options = {}) {
     openTaskCheckStage = 'select_due_tasks';
     const dueInfos = [];
     for (const info of candidateInfos) {
-      if (isCollabGroupName(info.groupName)) {
-        await markOpenTaskWatchResolved(info.taskId, 'collab_group_name');
-        skippedByReason.collab_group_name = (skippedByReason.collab_group_name || 0) + 1;
-        skippedExamplesByReason.collab_group_name ||= [];
-        if (skippedExamplesByReason.collab_group_name.length < 10) {
-          skippedExamplesByReason.collab_group_name.push({
-            task_id: info.taskId,
-            group_id: info.groupId || null,
-            group_name: info.groupName || null,
-          });
-        }
-        continue;
-      }
+      // Тестово отключено: проверяем открытую ветку без отсева групп по названию.
+      // if (isCollabGroupName(info.groupName)) {
+      //   await markOpenTaskWatchResolved(info.taskId, 'collab_group_name');
+      //   skippedByReason.collab_group_name = (skippedByReason.collab_group_name || 0) + 1;
+      //   skippedExamplesByReason.collab_group_name ||= [];
+      //   if (skippedExamplesByReason.collab_group_name.length < 10) {
+      //     skippedExamplesByReason.collab_group_name.push({
+      //       task_id: info.taskId,
+      //       group_id: info.groupId || null,
+      //       group_name: info.groupName || null,
+      //     });
+      //   }
+      //   continue;
+      // }
 
       const state = await getOpenTaskWatchState(info.taskId);
       if (isOpenTaskWatchDue(state)) dueInfos.push(info);
