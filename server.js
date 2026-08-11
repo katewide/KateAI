@@ -11,6 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
+const APP_VERSION = 'open-task-watch-debug-2026-08-12-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -2809,6 +2810,33 @@ function buildOpenTaskListQuery(offset) {
   };
 }
 
+function buildOpenTaskListControlQuery() {
+  return {
+    filter: {
+      STATUS: 2,
+      '<=CREATED_DATE': getIsoDaysAgo(OPEN_TASK_MIN_AGE_DAYS),
+    },
+    order: { ID: 'ASC' },
+    limit: 5000,
+    offset: 0,
+    select: [
+      'ID',
+      'TITLE',
+      'STATUS',
+      'GROUP_ID',
+      'CREATED_DATE',
+      'ACTIVITY_DATE',
+      'RESPONSIBLE_ID',
+      'CREATED_BY',
+      'PARENT_ID',
+      'CHAT_ID',
+      'TIME_SPENT_IN_LOGS',
+      'DURATION_FACT',
+      'GROUP',
+    ],
+  };
+}
+
 function isOpenTaskOldEnough(task) {
   const createdAtMs = Date.parse(getTaskCreatedDate(task));
   if (!Number.isFinite(createdAtMs)) return false;
@@ -2826,6 +2854,7 @@ async function fetchOpenTaskWatchCandidates() {
     status_2_tasks: 0,
     old_enough_tasks: 0,
     min_age_days: OPEN_TASK_MIN_AGE_DAYS,
+    control_without_group_filter: null,
   };
 
   for (let offset = 0; ; offset += 5000) {
@@ -2858,6 +2887,24 @@ async function fetchOpenTaskWatchCandidates() {
   const oldEnoughTasks = openTasks.filter(isOpenTaskOldEnough);
   searchDebug.status_2_tasks = openTasks.length;
   searchDebug.old_enough_tasks = oldEnoughTasks.length;
+
+  try {
+    const controlBody = buildOpenTaskListControlQuery();
+    const controlResponse = await coworkRequest('POST', '/tasks/search', controlBody);
+    const controlTasks = normalizeTaskListPayload(controlResponse);
+    searchDebug.control_without_group_filter = {
+      body: controlBody,
+      response_meta: controlResponse?.meta || null,
+      page_count: controlTasks.length,
+      sample_task_ids: controlTasks.slice(0, 20).map(task => String(task?.id || task?.ID || '')),
+      sample_group_ids: controlTasks.slice(0, 20).map(task => getGroupIdFromTask(task)),
+      sample_group_names: controlTasks.slice(0, 20).map(task => getGroupNameFromTask(task)),
+    };
+  } catch (error) {
+    searchDebug.control_without_group_filter = {
+      error: error.message,
+    };
+  }
 
   saveDebug('lastOpenTaskWatchSearch', searchDebug);
 
@@ -3874,6 +3921,7 @@ const server = http.createServer(async (req, res) => {
     if ((req.method === 'GET' || req.method === 'HEAD') && pathname === '/debug') {
       sendJson(res, 200, {
         ok: true,
+        app_version: APP_VERSION,
         storage: getStorageDebugInfo(),
         taskTimeCheckRunning: taskTimeCheckInProgress,
         taskTimeCheckStartedAt,
