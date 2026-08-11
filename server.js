@@ -68,6 +68,7 @@ const debugState = {
   lastClosedTaskProcessing: null,
   lastOpenTaskNextStep: null,
   lastOpenTaskWatchCheck: null,
+  lastOpenTaskWatchSearch: null,
   lastOpenTaskWatchChatDecision: null,
   lastTaskImages: null,
   lastImageOcr: null,
@@ -574,8 +575,18 @@ function getStatusFromTask(task) {
 }
 
 function getGroupIdFromTask(task) {
-  const groupId = task?.groupId || task?.groupID || task?.GroupID || task?.group_id || task?.GROUP_ID || task?.group?.id;
-  return groupId ? String(groupId) : null;
+  const groupId = (
+    task?.groupId ??
+    task?.groupID ??
+    task?.GroupID ??
+    task?.group_id ??
+    task?.GROUP_ID ??
+    task?.group?.id ??
+    task?.group?.ID ??
+    task?.GROUP?.id ??
+    task?.GROUP?.ID
+  );
+  return groupId == null || groupId === '' ? null : String(groupId);
 }
 
 function getParentIdFromTask(task) {
@@ -714,7 +725,7 @@ function isGemmaExcludedGroupId(groupId) {
 }
 
 function isOpenTaskExcludedGroupId(groupId) {
-  return OPEN_TASK_EXCLUDED_GROUP_IDS.has(String(groupId || ''));
+  return OPEN_TASK_EXCLUDED_GROUP_IDS.has(String(groupId ?? ''));
 }
 
 function getTaskTitle(task) {
@@ -2806,20 +2817,38 @@ function isOpenTaskOldEnough(task) {
 
 async function fetchOpenTaskWatchCandidates() {
   const tasks = [];
+  const searchDebug = {
+    status: 'fetch_open_tasks',
+    method: 'POST',
+    path: '/tasks/search',
+    requests: [],
+    raw_tasks_from_api: 0,
+    status_2_tasks: 0,
+    old_enough_tasks: 0,
+    min_age_days: OPEN_TASK_MIN_AGE_DAYS,
+  };
 
   for (let offset = 0; ; offset += 5000) {
     const body = buildOpenTaskListQuery(offset);
-    saveDebug('lastOpenTaskWatchCheck', {
-      status: 'fetch_open_tasks',
-      method: 'POST',
-      path: '/tasks/search',
-      body,
-      offset,
+    saveDebug('lastOpenTaskWatchSearch', {
+      ...searchDebug,
+      current_offset: offset,
+      current_body: body,
     });
 
     const response = await coworkRequest('POST', '/tasks/search', body);
     const pageTasks = normalizeTaskListPayload(response);
+    searchDebug.requests.push({
+      offset,
+      body,
+      response_meta: response?.meta || null,
+      page_count: pageTasks.length,
+      sample_task_ids: pageTasks.slice(0, 20).map(task => String(task?.id || task?.ID || '')),
+      sample_group_ids: pageTasks.slice(0, 20).map(task => getGroupIdFromTask(task)),
+      sample_group_names: pageTasks.slice(0, 20).map(task => getGroupNameFromTask(task)),
+    });
     tasks.push(...pageTasks);
+    searchDebug.raw_tasks_from_api = tasks.length;
 
     const hasMore = Boolean(response?.meta?.hasMore || response?.hasMore);
     if (!hasMore || pageTasks.length === 0) break;
@@ -2827,14 +2856,10 @@ async function fetchOpenTaskWatchCandidates() {
 
   const openTasks = tasks.filter(task => getStatusFromTask(task) === '2');
   const oldEnoughTasks = openTasks.filter(isOpenTaskOldEnough);
+  searchDebug.status_2_tasks = openTasks.length;
+  searchDebug.old_enough_tasks = oldEnoughTasks.length;
 
-  saveDebug('lastOpenTaskWatchCheck', {
-    status: 'open_tasks_fetched',
-    raw_tasks_from_api: tasks.length,
-    status_2_tasks: openTasks.length,
-    old_enough_tasks: oldEnoughTasks.length,
-    min_age_days: OPEN_TASK_MIN_AGE_DAYS,
-  });
+  saveDebug('lastOpenTaskWatchSearch', searchDebug);
 
   return oldEnoughTasks;
 }
@@ -3022,8 +3047,11 @@ async function markOpenTaskWatchResolved(taskId, reason) {
 function isOpenTaskWatchDue(state, now = new Date()) {
   if (!state) return true;
   if (state.resolved_at) return false;
-  if (!state.last_recheck_at) return true;
-  return Date.parse(state.last_recheck_at) <= now.getTime();
+  // Ручная проверка открытых задач должна повторно анализировать уже найденные задачи.
+  // Иначе сохраненный last_recheck_at скрывает их из ai-test/debug до следующей даты.
+  return true;
+  // if (!state.last_recheck_at) return true;
+  // return Date.parse(state.last_recheck_at) <= now.getTime();
 }
 
 function incrementOpenTaskGroupCount(counts, taskOrInfo) {
