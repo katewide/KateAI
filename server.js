@@ -3093,6 +3093,7 @@ async function markOpenTaskWatchResolved(taskId, reason) {
 
 function isOpenTaskWatchDue(state, now = new Date()) {
   if (!state) return true;
+  if (state.resolved_at && state.resolved_reason === 'collab_group_name') return true;
   if (state.resolved_at) return false;
   // Ручная проверка открытых задач должна повторно анализировать уже найденные задачи.
   // Иначе сохраненный last_recheck_at скрывает их из ai-test/debug до следующей даты.
