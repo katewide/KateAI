@@ -531,17 +531,17 @@ function getUserIdFromObject(user) {
 function getUserDisplayName(user) {
   if (!user || typeof user !== 'object') return null;
 
-  const fullName = user.fullName || user.FULL_NAME;
-  if (typeof fullName === 'string' && fullName.trim()) return fullName.trim();
-
   const firstName = user.name || user.firstName || user.NAME || user.FIRST_NAME || '';
-  const secondName = user.secondName || user.SECOND_NAME || '';
   const lastName = user.lastName || user.LAST_NAME || '';
-  const nameParts = [firstName, secondName, lastName]
+  const nameParts = [firstName, lastName]
     .map(part => String(part || '').trim())
     .filter(Boolean);
 
-  return nameParts.join(' ').trim() || null;
+  const firstAndLastName = nameParts.join(' ').trim();
+  if (firstAndLastName) return firstAndLastName;
+
+  const fullName = user.fullName || user.FULL_NAME;
+  return typeof fullName === 'string' && fullName.trim() ? fullName.trim() : null;
 }
 
 function normalizeUserPayload(response) {
