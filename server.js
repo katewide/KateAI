@@ -19,7 +19,8 @@ const WEBHOOK_TOKEN = requireEnv('WEBHOOK_TOKEN');
 const ELAPSED_NOTIFICATION_CHAT_ID = process.env.ELAPSED_NOTIFICATION_CHAT_ID || 'chat42358';
 const BITRIX_PORTAL_URL = process.env.BITRIX_PORTAL_URL || 'https://elros.bitrix24.ru';
 const DATA_DIR = process.env.DATA_DIR || (process.env.NODE_ENV === 'production' ? '/data' : __dirname);
-const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'task_time_logs.db');
+const DB_FILENAME = process.env.DB_FILENAME || 'task_time_logs_v2.db';
+const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, DB_FILENAME);
 const TASK_TIME_LOOKBACK_DAYS = Number(process.env.TASK_TIME_LOOKBACK_DAYS || 180);
 const TASK_TIME_CHECK_HOUR_MSK = Number(process.env.TASK_TIME_CHECK_HOUR_MSK || 20);
 const TASK_TIME_CHECK_MINUTE_MSK = Number(process.env.TASK_TIME_CHECK_MINUTE_MSK || 0);
@@ -41,10 +42,12 @@ const AUDIO_TRANSCRIPTION_MODEL = 'bitrix/deepdml/faster-whisper-large-v3-turbo-
 const AI_MAX_AUDIO_FILES = 10;
 const AI_MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 const TASK_SUMMARY_FIELD_CODE = 'UF_TASK_TITLE';
+const UNKNOWN_USER_NAME = 'Неизвестный пользователь';
 
 let taskTimeCheckInProgress = false;
 let taskTimeCheckStartedAt = null;
 let taskTimeCheckStage = null;
+const userNameCache = new Map();
 const debugState = {
   lastRequest: null,
   lastTaskTimeCheckRequest: null,
@@ -518,6 +521,67 @@ function getCreatorIdFromTask(task) {
     task?.creator?.id
   );
   return creatorId ? String(creatorId).replace(/^user_/i, '') : null;
+}
+
+function getUserIdFromObject(user) {
+  const userId = user?.id ?? user?.ID ?? user?.userId ?? user?.USER_ID;
+  return userId == null ? null : String(userId).replace(/^user_/i, '');
+}
+
+function getUserDisplayName(user) {
+  if (!user || typeof user !== 'object') return null;
+
+  const fullName = user.fullName || user.FULL_NAME;
+  if (typeof fullName === 'string' && fullName.trim()) return fullName.trim();
+
+  const firstName = user.name || user.firstName || user.NAME || user.FIRST_NAME || '';
+  const secondName = user.secondName || user.SECOND_NAME || '';
+  const lastName = user.lastName || user.LAST_NAME || '';
+  const nameParts = [firstName, secondName, lastName]
+    .map(part => String(part || '').trim())
+    .filter(Boolean);
+
+  return nameParts.join(' ').trim() || null;
+}
+
+function normalizeUserPayload(response) {
+  const data = unwrapData(response);
+  return data?.user || data?.User || data;
+}
+
+function rememberUserName(user) {
+  const userId = getUserIdFromObject(user);
+  const userName = getUserDisplayName(user);
+  if (userId && userName) userNameCache.set(userId, userName);
+  return userName;
+}
+
+function rememberTaskUserNames(task) {
+  [
+    task?.creator,
+    task?.responsible,
+    ...Object.values(task?.accomplicesData || {}),
+    ...Object.values(task?.auditorsData || {}),
+  ].forEach(rememberUserName);
+}
+
+async function getUserNameById(userId) {
+  const normalizedUserId = normalizeId(userId);
+  if (!normalizedUserId) return null;
+
+  const cacheKey = String(normalizedUserId);
+  if (userNameCache.has(cacheKey)) return userNameCache.get(cacheKey);
+
+  try {
+    const response = await coworkRequest('GET', `/users/${encodeURIComponent(cacheKey)}`);
+    const userName = rememberUserName(normalizeUserPayload(response));
+    userNameCache.set(cacheKey, userName || null);
+    return userName || null;
+  } catch (error) {
+    log('User name fetch failed', { user_id: cacheKey, error: error.message });
+    userNameCache.set(cacheKey, null);
+    return null;
+  }
 }
 
 function getGroupNameFromTask(task) {
@@ -1433,14 +1497,11 @@ function getChangeVerb(minutes) {
 }
 
 function getHistoryUserName(historyItem) {
-  const name = historyItem?.user?.name || '';
-  const lastName = historyItem?.user?.lastName || '';
-  const fullName = `${name} ${lastName}`.trim();
-  return fullName || 'Неизвестный пользователь';
+  return getUserDisplayName(historyItem?.user) || null;
 }
 
 function getHistoryUserId(historyItem) {
-  return historyItem?.user?.id || historyItem?.userId || historyItem?.USER_ID || null;
+  return getUserIdFromObject(historyItem?.user) || historyItem?.userId || historyItem?.USER_ID || null;
 }
 
 function getHistoryTimeDiffMinutes(historyItem) {
@@ -1463,26 +1524,32 @@ async function getTimeHistoryChangesForTask(task, previousState, fallbackChange)
   const lastCheckedAtMs = Date.parse(previousState?.last_checked_at);
   const history = await getTaskHistory(taskId);
   const taskLink = buildTaskLink(task);
+  rememberTaskUserNames(task);
 
-  const historyChanges = history
+  const historyChanges = await Promise.all(history
     .filter(isTimeSpentHistoryItem)
     .filter(item => !Number.isFinite(lastCheckedAtMs) || item.createdAtMs > lastCheckedAtMs)
     .sort((a, b) => a.createdAtMs - b.createdAtMs)
-    .map(item => ({
-      task,
-      taskId,
-      taskLink,
-      title: getTaskTitle(task),
-      groupId: getGroupIdFromTask(task),
-      userId: getHistoryUserId(item),
-      userName: getHistoryUserName(item),
-      oldTimeSpent: Number.parseInt(item.value?.from ?? 0, 10) || 0,
-      newTimeSpent: Number.parseInt(item.value?.to ?? 0, 10) || 0,
-      oldDurationFact: Math.round((Number.parseInt(item.value?.from ?? 0, 10) || 0) / 60),
-      newDurationFact: Math.round((Number.parseInt(item.value?.to ?? 0, 10) || 0) / 60),
-      diffMinutes: getHistoryTimeDiffMinutes(item),
-      history_id: item.id || null,
-      history_created_date: item.createdDate || null,
+    .map(async item => {
+      const userId = getHistoryUserId(item);
+      const userName = getHistoryUserName(item) || await getUserNameById(userId);
+
+      return {
+        task,
+        taskId,
+        taskLink,
+        title: getTaskTitle(task),
+        groupId: getGroupIdFromTask(task),
+        userId,
+        userName: userName || (userId ? `Пользователь ${userId}` : UNKNOWN_USER_NAME),
+        oldTimeSpent: Number.parseInt(item.value?.from ?? 0, 10) || 0,
+        newTimeSpent: Number.parseInt(item.value?.to ?? 0, 10) || 0,
+        oldDurationFact: Math.round((Number.parseInt(item.value?.from ?? 0, 10) || 0) / 60),
+        newDurationFact: Math.round((Number.parseInt(item.value?.to ?? 0, 10) || 0) / 60),
+        diffMinutes: getHistoryTimeDiffMinutes(item),
+        history_id: item.id || null,
+        history_created_date: item.createdDate || null,
+      };
     }));
 
   if (historyChanges.length > 0) return historyChanges;
@@ -1490,7 +1557,7 @@ async function getTimeHistoryChangesForTask(task, previousState, fallbackChange)
   return [{
     ...fallbackChange,
     userId: null,
-    userName: 'Неизвестный пользователь',
+    userName: UNKNOWN_USER_NAME,
     history_id: null,
     history_created_date: null,
   }];
@@ -1499,10 +1566,10 @@ async function getTimeHistoryChangesForTask(task, previousState, fallbackChange)
 function saveTimeChatDecision(changes, message) {
   const taskIds = [...new Set(changes.map(change => change.taskId))];
   const users = [...new Map(changes.map(change => [
-    `${change.userId || ''}:${change.userName || 'Неизвестный пользователь'}`,
+    `${change.userId || ''}:${change.userName || UNKNOWN_USER_NAME}`,
     {
       user_id: change.userId || null,
-      user_name: change.userName || 'Неизвестный пользователь',
+      user_name: change.userName || UNKNOWN_USER_NAME,
     },
   ])).values()];
 
@@ -1521,7 +1588,7 @@ function buildTimeChangesMessage(changes) {
   const groups = new Map();
 
   for (const change of changes) {
-    const userName = change.userName || 'Неизвестный пользователь';
+    const userName = change.userName || UNKNOWN_USER_NAME;
     if (!groups.has(userName)) groups.set(userName, []);
     groups.get(userName).push(change);
   }
