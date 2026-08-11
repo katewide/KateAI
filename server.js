@@ -2753,26 +2753,31 @@ function isWorkgroupArchived(workgroup) {
 }
 
 function buildOpenTaskListQuery(offset) {
-  const params = new URLSearchParams();
-  params.set('limit', '5000');
-  params.set('offset', String(offset));
-  params.set('sort', 'id');
-  params.set('filter[status]', '2');
-  params.set('select', [
-    'id',
-    'title',
-    'status',
-    'groupId',
-    'createdDate',
-    'activityDate',
-    'responsibleId',
-    'createdBy',
-    'parentId',
-    'chatId',
-    'timeSpentInLogs',
-    'durationFact',
-  ].join(','));
-  return params.toString();
+  return {
+    filter: {
+      STATUS: 2,
+      '<=CREATED_DATE': getIsoDaysAgo(OPEN_TASK_MIN_AGE_DAYS),
+      '!GROUP_ID': [...OPEN_TASK_EXCLUDED_GROUP_IDS].map(Number),
+    },
+    order: { ID: 'ASC' },
+    limit: 5000,
+    offset,
+    select: [
+      'ID',
+      'TITLE',
+      'STATUS',
+      'GROUP_ID',
+      'CREATED_DATE',
+      'ACTIVITY_DATE',
+      'RESPONSIBLE_ID',
+      'CREATED_BY',
+      'PARENT_ID',
+      'CHAT_ID',
+      'TIME_SPENT_IN_LOGS',
+      'DURATION_FACT',
+      'GROUP',
+    ],
+  };
 }
 
 function isOpenTaskOldEnough(task) {
@@ -2785,15 +2790,16 @@ async function fetchOpenTaskWatchCandidates() {
   const tasks = [];
 
   for (let offset = 0; ; offset += 5000) {
-    const path = `/tasks?${buildOpenTaskListQuery(offset)}`;
+    const body = buildOpenTaskListQuery(offset);
     saveDebug('lastOpenTaskWatchCheck', {
       status: 'fetch_open_tasks',
-      method: 'GET',
-      path,
+      method: 'POST',
+      path: '/tasks/search',
+      body,
       offset,
     });
 
-    const response = await coworkRequest('GET', path);
+    const response = await coworkRequest('POST', '/tasks/search', body);
     const pageTasks = normalizeTaskListPayload(response);
     tasks.push(...pageTasks);
 
@@ -2822,33 +2828,9 @@ async function getOpenTaskCandidateInfo(task) {
   if (isOpenTaskExcludedGroupId(groupId)) return { task, taskId, included: false, reason: 'excluded_group_id', groupId };
 
   let groupName = getGroupNameFromTask(task);
-  let archived = getGroupArchivedFromTask(task);
-
-  if (!groupName || archived == null) {
-    const workgroup = await fetchWorkgroup(groupId);
-    groupName ||= getWorkgroupName(workgroup);
-    archived = isWorkgroupArchived(workgroup);
-  }
-
-  if (!groupName) {
-    try {
-      const taskResponse = await coworkRequest('GET', `/tasks/${encodeURIComponent(taskId)}`);
-      const fullTask = normalizeTaskPayload(taskResponse);
-      groupName = getGroupNameFromTask(fullTask);
-      archived = getGroupArchivedFromTask(fullTask);
-      task = fullTask || task;
-    } catch (error) {
-      log('Open task full task fetch for group name failed', {
-        task_id: taskId,
-        group_id: groupId,
-        error: error.message,
-      });
-    }
-  }
 
   if (!groupName) return { task, taskId, included: false, reason: 'group_name_not_found', groupId };
   if (isCollabGroupName(groupName)) return { task, taskId, included: false, reason: 'collab_group_name', groupId, groupName };
-  if (archived) return { task, taskId, included: false, reason: 'archived_group', groupId, groupName };
 
   return { task, taskId, included: true, groupId, groupName };
 }
@@ -2867,7 +2849,6 @@ async function checkOpenTaskWatchEligibility(taskId) {
     old_enough: isOpenTaskOldEnough(task),
     group_id: getGroupIdFromTask(task),
     group_name: getGroupNameFromTask(task) || info.groupName || null,
-    group_archived: getGroupArchivedFromTask(task),
     included_by_group_filters: info.included,
     group_filter_skip_reason: info.included ? null : info.reason,
     would_be_candidate: getStatusFromTask(task) === '2' && isOpenTaskOldEnough(task) && info.included,
@@ -3281,12 +3262,10 @@ async function resolveOpenTaskWatchStates(candidateIds) {
       const status = getStatusFromTask(task);
       const groupId = getGroupIdFromTask(task);
       let groupName = getGroupNameFromTask(task);
-      let archived = getGroupArchivedFromTask(task);
 
-      if (groupId && (!groupName || archived == null)) {
+      if (groupId && !groupName) {
         const workgroup = await fetchWorkgroup(groupId);
         groupName ||= getWorkgroupName(workgroup);
-        archived = isWorkgroupArchived(workgroup);
       }
 
       if (isTaskClosed(task)) {
@@ -3303,9 +3282,6 @@ async function resolveOpenTaskWatchStates(candidateIds) {
         resolved += 1;
       } else if (groupName && isCollabGroupName(groupName)) {
         await markOpenTaskWatchResolved(state.task_id, 'collab_group_name');
-        resolved += 1;
-      } else if (archived) {
-        await markOpenTaskWatchResolved(state.task_id, 'archived_group');
         resolved += 1;
       }
     } catch (error) {
