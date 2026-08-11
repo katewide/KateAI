@@ -2892,10 +2892,40 @@ async function fetchOpenTaskWatchCandidates() {
     const controlBody = buildOpenTaskListControlQuery();
     const controlResponse = await coworkRequest('POST', '/tasks/search', controlBody);
     const controlTasks = normalizeTaskListPayload(controlResponse);
+    const controlGroupCounts = {};
+    const controlLocalSkippedByReason = {};
+    const controlLocallyIncludedTasks = [];
+
+    for (const task of controlTasks) {
+      incrementOpenTaskGroupCount(controlGroupCounts, task);
+      const groupId = getGroupIdFromTask(task);
+      let skipReason = null;
+
+      if (getStatusFromTask(task) !== '2') skipReason = 'status_not_2';
+      else if (!isOpenTaskOldEnough(task)) skipReason = 'not_old_enough';
+      else if (!groupId) skipReason = 'no_group';
+      else if (isOpenTaskExcludedGroupId(groupId)) skipReason = 'excluded_group_id';
+
+      if (skipReason) {
+        controlLocalSkippedByReason[skipReason] = (controlLocalSkippedByReason[skipReason] || 0) + 1;
+      } else {
+        controlLocallyIncludedTasks.push(task);
+      }
+    }
+
     searchDebug.control_without_group_filter = {
       body: controlBody,
       response_meta: controlResponse?.meta || null,
       page_count: controlTasks.length,
+      local_group_counts: sortOpenTaskGroupCounts(controlGroupCounts),
+      locally_included_count: controlLocallyIncludedTasks.length,
+      locally_skipped_by_reason: controlLocalSkippedByReason,
+      locally_included_samples: controlLocallyIncludedTasks.slice(0, 30).map(task => ({
+        task_id: String(task?.id || task?.ID || ''),
+        group_id: getGroupIdFromTask(task),
+        group_name: getGroupNameFromTask(task),
+        created_date: getTaskCreatedDate(task),
+      })),
       sample_task_ids: controlTasks.slice(0, 20).map(task => String(task?.id || task?.ID || '')),
       sample_group_ids: controlTasks.slice(0, 20).map(task => getGroupIdFromTask(task)),
       sample_group_names: controlTasks.slice(0, 20).map(task => getGroupNameFromTask(task)),
