@@ -1,4 +1,4 @@
-const http = require('http');
+\const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
@@ -706,7 +706,7 @@ function isCollabGroupName(groupName) {
     .replace(/\s+/g, ' ')
     .trim();
 
-  return /\bколлаб[а-я]*\b/u.test(normalized);
+  return normalized.includes('коллаб');
 }
 
 function isGemmaExcludedGroupId(groupId) {
@@ -3371,6 +3371,20 @@ async function runOpenTaskWatchCheck(options = {}) {
     openTaskCheckStage = 'select_due_tasks';
     const dueInfos = [];
     for (const info of candidateInfos) {
+      if (isCollabGroupName(info.groupName)) {
+        await markOpenTaskWatchResolved(info.taskId, 'collab_group_name');
+        skippedByReason.collab_group_name = (skippedByReason.collab_group_name || 0) + 1;
+        skippedExamplesByReason.collab_group_name ||= [];
+        if (skippedExamplesByReason.collab_group_name.length < 10) {
+          skippedExamplesByReason.collab_group_name.push({
+            task_id: info.taskId,
+            group_id: info.groupId || null,
+            group_name: info.groupName || null,
+          });
+        }
+        continue;
+      }
+
       const state = await getOpenTaskWatchState(info.taskId);
       if (isOpenTaskWatchDue(state)) dueInfos.push(info);
     }
