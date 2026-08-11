@@ -48,7 +48,7 @@ const UNKNOWN_USER_NAME = 'Неизвестный пользователь';
 const OPEN_TASK_MIN_AGE_DAYS = Number(process.env.OPEN_TASK_MIN_AGE_DAYS || 7);
 const OPEN_TASK_DEFAULT_RECHECK_DAYS = Number(process.env.OPEN_TASK_DEFAULT_RECHECK_DAYS || 7);
 const OPEN_TASK_DEFAULT_LIMIT = Number(process.env.OPEN_TASK_DEFAULT_LIMIT || 10);
-const OPEN_TASK_EXCLUDED_GROUP_IDS = new Set(['12', '58', '92', '140', '276', '376', '490']);
+const OPEN_TASK_EXCLUDED_GROUP_IDS = new Set(['0', '12', '58', '92', '140', '276', '376', '490']);
 
 let taskTimeCheckInProgress = false;
 let taskTimeCheckStartedAt = null;
@@ -664,7 +664,19 @@ async function getUserNameById(userId) {
 }
 
 function getGroupNameFromTask(task) {
-  return task?.groupName || task?.group?.name || task?.group?.title || null;
+  return (
+    task?.groupName ||
+    task?.GROUP_NAME ||
+    task?.group?.name ||
+    task?.group?.NAME ||
+    task?.group?.title ||
+    task?.group?.TITLE ||
+    task?.GROUP?.name ||
+    task?.GROUP?.NAME ||
+    task?.GROUP?.title ||
+    task?.GROUP?.TITLE ||
+    null
+  );
 }
 
 function getTaskCreatedDate(task) {
@@ -688,7 +700,13 @@ function getTaskChatId(task) {
 }
 
 function isCollabGroupName(groupName) {
-  return String(groupName || '').toLowerCase().includes('коллаба');
+  const normalized = String(groupName || '')
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return /\bколлаб[а-я]*\b/u.test(normalized);
 }
 
 function isGemmaExcludedGroupId(groupId) {
@@ -2829,9 +2847,6 @@ async function getOpenTaskCandidateInfo(task) {
 
   let groupName = getGroupNameFromTask(task);
 
-  if (!groupName) return { task, taskId, included: false, reason: 'group_name_not_found', groupId };
-  if (isCollabGroupName(groupName)) return { task, taskId, included: false, reason: 'collab_group_name', groupId, groupName };
-
   return { task, taskId, included: true, groupId, groupName };
 }
 
@@ -3108,6 +3123,16 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
   if (context.skipped) {
     await markOpenTaskWatchResolved(taskId, context.reason);
     return { task_id: taskId, skipped: true, reason: context.reason };
+  }
+
+  if (isCollabGroupName(context.groupName)) {
+    return {
+      task_id: taskId,
+      skipped: true,
+      reason: 'collab_group_name',
+      group_id: context.groupId || candidateInfo.groupId || null,
+      group_name: context.groupName || candidateInfo.groupName || null,
+    };
   }
 
   rememberTaskUserNames(context.task);
