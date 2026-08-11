@@ -21,6 +21,8 @@ const BITRIX_PORTAL_URL = process.env.BITRIX_PORTAL_URL || 'https://elros.bitrix
 const DATA_DIR = process.env.DATA_DIR || (process.env.NODE_ENV === 'production' ? '/data' : __dirname);
 const DB_FILENAME = process.env.DB_FILENAME || 'task_time_logs_v2.db';
 const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, DB_FILENAME);
+const OPEN_TASK_DB_FILENAME = process.env.OPEN_TASK_DB_FILENAME || 'open_task_watch.db';
+const OPEN_TASK_DB_PATH = process.env.OPEN_TASK_DB_PATH || path.join(DATA_DIR, OPEN_TASK_DB_FILENAME);
 const TASK_TIME_LOOKBACK_DAYS = Number(process.env.TASK_TIME_LOOKBACK_DAYS || 180);
 const TASK_TIME_CHECK_HOUR_MSK = Number(process.env.TASK_TIME_CHECK_HOUR_MSK || 20);
 const TASK_TIME_CHECK_MINUTE_MSK = Number(process.env.TASK_TIME_CHECK_MINUTE_MSK || 0);
@@ -43,11 +45,19 @@ const AI_MAX_AUDIO_FILES = 10;
 const AI_MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 const TASK_SUMMARY_FIELD_CODE = 'UF_TASK_TITLE';
 const UNKNOWN_USER_NAME = 'Неизвестный пользователь';
+const OPEN_TASK_MIN_AGE_DAYS = Number(process.env.OPEN_TASK_MIN_AGE_DAYS || 7);
+const OPEN_TASK_DEFAULT_RECHECK_DAYS = Number(process.env.OPEN_TASK_DEFAULT_RECHECK_DAYS || 7);
+const OPEN_TASK_DEFAULT_LIMIT = Number(process.env.OPEN_TASK_DEFAULT_LIMIT || 10);
+const OPEN_TASK_EXCLUDED_GROUP_IDS = new Set(['12', '58', '92', '140', '276', '376', '490']);
 
 let taskTimeCheckInProgress = false;
 let taskTimeCheckStartedAt = null;
 let taskTimeCheckStage = null;
+let openTaskCheckInProgress = false;
+let openTaskCheckStartedAt = null;
+let openTaskCheckStage = null;
 const userNameCache = new Map();
+const workgroupCache = new Map();
 const debugState = {
   lastRequest: null,
   lastTaskTimeCheckRequest: null,
@@ -57,6 +67,8 @@ const debugState = {
   lastTaskCloseDecision: null,
   lastClosedTaskProcessing: null,
   lastOpenTaskNextStep: null,
+  lastOpenTaskWatchCheck: null,
+  lastOpenTaskWatchChatDecision: null,
   lastTaskImages: null,
   lastImageOcr: null,
   lastError: null,
@@ -64,7 +76,9 @@ const debugState = {
 const closedTaskProcessingTaskIds = new Set();
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+fs.mkdirSync(path.dirname(OPEN_TASK_DB_PATH), { recursive: true });
 const db = new sqlite3.Database(DB_PATH);
+const openTaskDb = new sqlite3.Database(OPEN_TASK_DB_PATH);
 db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS task_time_state (
     task_id TEXT PRIMARY KEY,
@@ -90,6 +104,46 @@ db.serialize(() => {
     sent_at TEXT NOT NULL
   )`);
 
+});
+
+openTaskDb.serialize(() => {
+  openTaskDb.run(`CREATE TABLE IF NOT EXISTS open_task_watch_state (
+    task_id TEXT PRIMARY KEY,
+    created_at TEXT,
+    group_id TEXT,
+    group_name TEXT,
+    responsible_id TEXT,
+    responsible_name TEXT,
+    task_link TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_checked_at TEXT,
+    last_ai_result_json TEXT,
+    last_reason TEXT,
+    last_action TEXT,
+    last_summary TEXT,
+    last_recheck_at TEXT,
+    last_alert_sent_at TEXT,
+    last_alert_status TEXT,
+    resolved_at TEXT,
+    resolved_reason TEXT,
+    updated_at TEXT NOT NULL
+  )`);
+
+  openTaskDb.run(`CREATE TABLE IF NOT EXISTS open_task_watch_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    alert_status TEXT NOT NULL,
+    reason TEXT,
+    action TEXT,
+    summary TEXT,
+    responsible_id TEXT,
+    responsible_name TEXT,
+    group_id TEXT,
+    group_name TEXT,
+    task_link TEXT,
+    sent_at TEXT NOT NULL,
+    ai_result_json TEXT
+  )`);
 });
 
 function log(message, data) {
@@ -121,16 +175,23 @@ function checkPathWritable(targetPath) {
 
 function getStorageDebugInfo() {
   const dbDir = path.dirname(DB_PATH);
+  const openTaskDbDir = path.dirname(OPEN_TASK_DB_PATH);
   return {
     data_dir: DATA_DIR,
     db_path: DB_PATH,
     db_dir: dbDir,
+    open_task_db_path: OPEN_TASK_DB_PATH,
+    open_task_db_dir: openTaskDbDir,
     data_dir_exists: fs.existsSync(DATA_DIR),
     db_dir_exists: fs.existsSync(dbDir),
+    open_task_db_dir_exists: fs.existsSync(openTaskDbDir),
     data_dir_writable: fs.existsSync(DATA_DIR) ? checkPathWritable(DATA_DIR) : false,
     db_dir_writable: fs.existsSync(dbDir) ? checkPathWritable(dbDir) : false,
+    open_task_db_dir_writable: fs.existsSync(openTaskDbDir) ? checkPathWritable(openTaskDbDir) : false,
     db_file_exists: fs.existsSync(DB_PATH),
     db_file_writable: fs.existsSync(DB_PATH) ? checkPathWritable(DB_PATH) : null,
+    open_task_db_file_exists: fs.existsSync(OPEN_TASK_DB_PATH),
+    open_task_db_file_writable: fs.existsSync(OPEN_TASK_DB_PATH) ? checkPathWritable(OPEN_TASK_DB_PATH) : null,
   };
 }
 
@@ -429,9 +490,27 @@ function queryDb(sql, params = []) {
   });
 }
 
+function queryOpenTaskDb(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    openTaskDb.all(sql, params, (err, rows) => {
+      if (err) reject(err);
+      else resolve(rows);
+    });
+  });
+}
+
 function runDb(sql, params = []) {
   return new Promise((resolve, reject) => {
     db.run(sql, params, function onRun(err) {
+      if (err) reject(err);
+      else resolve(this);
+    });
+  });
+}
+
+function runOpenTaskDb(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    openTaskDb.run(sql, params, function onRun(err) {
       if (err) reject(err);
       else resolve(this);
     });
@@ -588,6 +667,21 @@ function getGroupNameFromTask(task) {
   return task?.groupName || task?.group?.name || task?.group?.title || null;
 }
 
+function getTaskCreatedDate(task) {
+  return task?.createdDate || task?.CREATED_DATE || null;
+}
+
+function getTaskActivityDate(task) {
+  return task?.activityDate || task?.ACTIVITY_DATE || null;
+}
+
+function getGroupArchivedFromTask(task) {
+  const archived = task?.group?.archived ?? task?.group?.ARCHIVED ?? task?.groupArchived ?? task?.GROUP_ARCHIVED;
+  if (typeof archived === 'boolean') return archived;
+  if (archived == null) return null;
+  return ['Y', 'YES', 'TRUE', '1'].includes(String(archived).toUpperCase());
+}
+
 function getTaskChatId(task) {
   const chatId = task?.chatId || task?.CHAT_ID || task?.chat?.id;
   return chatId ? String(chatId).replace(/^chat/i, '') : null;
@@ -599,6 +693,10 @@ function isCollabGroupName(groupName) {
 
 function isGemmaExcludedGroupId(groupId) {
   return GEMMA_EXCLUDED_GROUP_IDS.has(String(groupId || ''));
+}
+
+function isOpenTaskExcludedGroupId(groupId) {
+  return OPEN_TASK_EXCLUDED_GROUP_IDS.has(String(groupId || ''));
 }
 
 function getTaskTitle(task) {
@@ -2135,6 +2233,117 @@ ${JSON.stringify(context, null, 2)}
 <1-2 предложения: что нужно сделать дальше>`;
 }
 
+function buildOpenTaskWatchPrompt({ taskId, groupId, responsibleId, creatorId, task, comments, timeLogs, history, images, imageFacts, audioTranscripts, parentContext }) {
+  const context = {
+    currentDate: new Date().toISOString(),
+    currentTaskId: taskId,
+    groupId,
+    responsibleId,
+    creatorId,
+    minAgeDays: OPEN_TASK_MIN_AGE_DAYS,
+    defaultRecheckDays: OPEN_TASK_DEFAULT_RECHECK_DAYS,
+    staleAfterDaysWithoutUsefulUpdates: 14,
+    task,
+    comments,
+    timeLogs,
+    timeSpentInLogs: getTaskTimeSpent(task),
+    durationFact: getTaskDurationFact(task),
+    history,
+    images: getImageMetadata(images),
+    imageFacts,
+    audioTranscripts,
+    parentContext,
+  };
+
+  return `Ты - координатор поддержки 1С. Твоя задача — проанализировать открытую задачу в статусе "Ждет выполнения" и решить, нужно ли сейчас привлекать внимание.
+
+НИЖЕ ПРИВЕДЕН КОНТЕКСТ ЗАДАЧИ И БАЗОВОЙ ЗАДАЧИ ПРИ НАЛИЧИИ (JSON):
+${JSON.stringify(context, null, 2)}
+
+ВЕРНИ ТОЛЬКО ВАЛИДНЫЙ JSON БЕЗ MARKDOWN:
+{
+  "reason": "WAIT_CLIENT",
+  "summary": "Клиент должен предоставить резервную копию базы.",
+  "action": "WAIT",
+  "recheck_days": 7,
+  "needs_attention": false
+}
+
+ДОПУСТИМЫЕ ЗНАЧЕНИЯ:
+- reason: WAIT_CLIENT или WAIT_ELROS.
+- action: WAIT, REMIND или STALE.
+- recheck_days: целое число дней до следующей проверки.
+- needs_attention: boolean.
+
+ПРАВИЛА:
+- Используй только факты из JSON, не придумывай договоренности, сроки и выполненные работы.
+- Учитывай описание задачи, комментарии, историю, трудозатраты, OCR изображений, расшифровки аудио и базовую задачу.
+- Комментарии и история последних действий важнее исходного описания.
+- Если сотрудник описал решение проблемы, результат проверки, настройку или инструкцию для клиента, считай, что это отправлено заказчику и теперь ожидается ответ клиента: reason WAIT_CLIENT.
+- WAIT_CLIENT означает, что следующий шаг или ответ находится на стороне клиента.
+- WAIT_ELROS означает, что следующий шаг находится на стороне ЭЛРОС.
+- action WAIT ставь, если по задаче есть понятный активный следующий шаг или указан будущий срок/звонок/ожидание и сейчас не нужно никого дергать.
+- action REMIND ставь, если 7+ дней нет полезной активности и понятно, чью сторону нужно напомнить.
+- action STALE ставь, если 14+ дней нет полезных апдейтов, непонятно что происходит, клиент не отвечает после попыток связи или участники не добавили новых условий/сроков.
+- Для action STALE всегда ставь needs_attention true.
+- Для WAIT_CLIENT + WAIT и WAIT_ELROS + WAIT ставь needs_attention false.
+- Для WAIT_CLIENT + REMIND и WAIT_ELROS + REMIND ставь needs_attention true.
+- Если в задаче прямо указан будущий срок, звонок или отпуск, recheck_days рассчитай от currentDate до первого рабочего дня, когда задачу нужно проверить после этого события. Например, звонок 12.08 — проверить 13.08; отпуск до сентября — проверить 02.09.
+- Если явного срока нет, recheck_days = ${OPEN_TASK_DEFAULT_RECHECK_DAYS}.
+- summary должен быть одним коротким предложением: что ожидается или почему задача требует внимания.`;
+}
+
+function parseAiJsonObject(text) {
+  const raw = String(text || '').trim();
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced ? fenced[1].trim() : raw;
+  const objectMatch = candidate.match(/\{[\s\S]*\}/);
+  if (!objectMatch) throw new Error(`AI response does not contain JSON object: ${truncateDebugText(raw, 500)}`);
+  return JSON.parse(objectMatch[0]);
+}
+
+function normalizeOpenTaskAiResult(value) {
+  const reason = ['WAIT_CLIENT', 'WAIT_ELROS'].includes(value?.reason) ? value.reason : 'WAIT_ELROS';
+  const action = ['WAIT', 'REMIND', 'STALE'].includes(value?.action) ? value.action : 'STALE';
+  const recheckDays = Number.parseInt(value?.recheck_days, 10);
+  const normalizedAction = action === 'STALE' ? 'STALE' : action;
+  const needsAttention = normalizedAction === 'STALE' || normalizedAction === 'REMIND';
+
+  return {
+    reason,
+    summary: String(value?.summary || '').trim() || 'Нужно уточнить актуальное состояние задачи.',
+    action: normalizedAction,
+    recheck_days: Number.isInteger(recheckDays) && recheckDays > 0 ? recheckDays : OPEN_TASK_DEFAULT_RECHECK_DAYS,
+    needs_attention: needsAttention,
+  };
+}
+
+function getOpenTaskAlertStatus(aiResult) {
+  if (aiResult.action === 'STALE') return '🔴 Требует решения по актуальности';
+  if (aiResult.reason === 'WAIT_CLIENT' && aiResult.action === 'REMIND') return '🟡 Ждет ответа заказчика';
+  if (aiResult.reason === 'WAIT_ELROS' && aiResult.action === 'REMIND') return '🟠 Ждет ответа от ЭЛРОС';
+  return null;
+}
+
+function getIsoDaysAgo(days) {
+  const date = new Date();
+  date.setDate(date.getDate() - days);
+  return date.toISOString();
+}
+
+function getNextRecheckAt(recheckDays) {
+  const date = new Date();
+  date.setDate(date.getDate() + recheckDays);
+  return date.toISOString();
+}
+
+function formatDateForMessage(isoDate) {
+  if (!isoDate) return 'не указана';
+  const date = new Date(isoDate);
+  if (!Number.isFinite(date.getTime())) return isoDate;
+  return date.toLocaleDateString('ru-RU', { timeZone: 'Europe/Moscow' });
+}
+
 async function processClosedTask(taskId, options = {}) {
   const dryRun = Boolean(options.dryRun);
   const { task: mainTask, comments: mainComments, commentsSource } = await fetchTaskWithComments(taskId);
@@ -2510,6 +2719,669 @@ async function processOpenTaskNextStep(taskId) {
   return result;
 }
 
+function normalizeWorkgroupPayload(response) {
+  const data = unwrapData(response);
+  return data?.workgroup || data?.group || data?.Workgroup || data;
+}
+
+async function fetchWorkgroup(groupId) {
+  const normalizedGroupId = String(groupId || '');
+  if (!normalizedGroupId) return null;
+  if (workgroupCache.has(normalizedGroupId)) return workgroupCache.get(normalizedGroupId);
+
+  try {
+    const response = await coworkRequest('GET', `/workgroups/${encodeURIComponent(normalizedGroupId)}`);
+    const workgroup = normalizeWorkgroupPayload(response);
+    workgroupCache.set(normalizedGroupId, workgroup || null);
+    return workgroup || null;
+  } catch (error) {
+    log('Workgroup fetch failed', { group_id: normalizedGroupId, error: error.message });
+    workgroupCache.set(normalizedGroupId, null);
+    return null;
+  }
+}
+
+function getWorkgroupName(workgroup) {
+  return workgroup?.name || workgroup?.NAME || workgroup?.title || workgroup?.TITLE || null;
+}
+
+function isWorkgroupArchived(workgroup) {
+  const archived = workgroup?.archived ?? workgroup?.ARCHIVED;
+  if (typeof archived === 'boolean') return archived;
+  if (archived == null) return false;
+  return ['Y', 'YES', 'TRUE', '1'].includes(String(archived).toUpperCase());
+}
+
+function buildOpenTaskListQuery(offset) {
+  const params = new URLSearchParams();
+  params.set('limit', '5000');
+  params.set('offset', String(offset));
+  params.set('sort', 'id');
+  params.set('filter[status]', '2');
+  params.set('filter[createdDate][$lte]', getIsoDaysAgo(OPEN_TASK_MIN_AGE_DAYS));
+  params.set('select', [
+    'id',
+    'title',
+    'status',
+    'groupId',
+    'createdDate',
+    'activityDate',
+    'responsibleId',
+    'createdBy',
+    'parentId',
+    'chatId',
+    'timeSpentInLogs',
+    'durationFact',
+  ].join(','));
+  return params.toString();
+}
+
+async function fetchOpenTaskWatchCandidates() {
+  const tasks = [];
+
+  for (let offset = 0; ; offset += 5000) {
+    const path = `/tasks?${buildOpenTaskListQuery(offset)}`;
+    saveDebug('lastOpenTaskWatchCheck', {
+      status: 'fetch_open_tasks',
+      method: 'GET',
+      path,
+      offset,
+    });
+
+    const response = await coworkRequest('GET', path);
+    const pageTasks = normalizeTaskListPayload(response);
+    tasks.push(...pageTasks);
+
+    const hasMore = Boolean(response?.meta?.hasMore || response?.hasMore);
+    if (!hasMore || pageTasks.length === 0) break;
+  }
+
+  return tasks.filter(task => getStatusFromTask(task) === '2');
+}
+
+async function getOpenTaskCandidateInfo(task) {
+  const taskId = String(task?.id || task?.ID || '');
+  const groupId = getGroupIdFromTask(task);
+  if (!groupId) return { task, taskId, included: false, reason: 'no_group' };
+  if (isOpenTaskExcludedGroupId(groupId)) return { task, taskId, included: false, reason: 'excluded_group_id', groupId };
+
+  let groupName = getGroupNameFromTask(task);
+  let archived = getGroupArchivedFromTask(task);
+
+  if (!groupName || archived == null) {
+    const workgroup = await fetchWorkgroup(groupId);
+    groupName ||= getWorkgroupName(workgroup);
+    archived = isWorkgroupArchived(workgroup);
+  }
+
+  if (!groupName) return { task, taskId, included: false, reason: 'group_name_not_found', groupId };
+  if (isCollabGroupName(groupName)) return { task, taskId, included: false, reason: 'collab_group_name', groupId, groupName };
+  if (archived) return { task, taskId, included: false, reason: 'archived_group', groupId, groupName };
+
+  return { task, taskId, included: true, groupId, groupName };
+}
+
+async function getOpenTaskWatchState(taskId) {
+  const rows = await queryOpenTaskDb(
+    'SELECT * FROM open_task_watch_state WHERE task_id = ?',
+    [String(taskId)]
+  );
+  return rows[0] || null;
+}
+
+async function getUnresolvedOpenTaskWatchStates() {
+  return queryOpenTaskDb(
+    'SELECT * FROM open_task_watch_state WHERE resolved_at IS NULL'
+  );
+}
+
+async function saveOpenTaskWatchState({ task, groupId, groupName, aiResult, nextRecheckAt }) {
+  const taskId = String(task?.id || task?.ID);
+  const now = new Date().toISOString();
+  const responsibleId = getResponsibleIdFromTask(task);
+  const responsibleName = await getUserNameById(responsibleId);
+  const existing = await getOpenTaskWatchState(taskId);
+
+  await runOpenTaskDb(`
+    INSERT INTO open_task_watch_state (
+      task_id,
+      created_at,
+      group_id,
+      group_name,
+      responsible_id,
+      responsible_name,
+      task_link,
+      first_seen_at,
+      last_checked_at,
+      last_ai_result_json,
+      last_reason,
+      last_action,
+      last_summary,
+      last_recheck_at,
+      last_alert_sent_at,
+      last_alert_status,
+      resolved_at,
+      resolved_reason,
+      updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+    ON CONFLICT(task_id) DO UPDATE SET
+      created_at = excluded.created_at,
+      group_id = excluded.group_id,
+      group_name = excluded.group_name,
+      responsible_id = excluded.responsible_id,
+      responsible_name = excluded.responsible_name,
+      task_link = excluded.task_link,
+      last_checked_at = excluded.last_checked_at,
+      last_ai_result_json = excluded.last_ai_result_json,
+      last_reason = excluded.last_reason,
+      last_action = excluded.last_action,
+      last_summary = excluded.last_summary,
+      last_recheck_at = excluded.last_recheck_at,
+      last_alert_sent_at = COALESCE(excluded.last_alert_sent_at, open_task_watch_state.last_alert_sent_at),
+      last_alert_status = COALESCE(excluded.last_alert_status, open_task_watch_state.last_alert_status),
+      resolved_at = NULL,
+      resolved_reason = NULL,
+      updated_at = excluded.updated_at
+  `, [
+    taskId,
+    getTaskCreatedDate(task),
+    groupId,
+    groupName,
+    responsibleId,
+    responsibleName || null,
+    buildTaskLink(task),
+    existing?.first_seen_at || now,
+    now,
+    JSON.stringify(aiResult),
+    aiResult.reason,
+    aiResult.action,
+    aiResult.summary,
+    nextRecheckAt,
+    null,
+    null,
+    now,
+  ]);
+
+  return {
+    task_id: taskId,
+    responsible_id: responsibleId,
+    responsible_name: responsibleName || (responsibleId ? `Пользователь ${responsibleId}` : UNKNOWN_USER_NAME),
+    group_id: groupId,
+    group_name: groupName,
+    task_link: buildTaskLink(task),
+  };
+}
+
+async function saveOpenTaskWatchAlert(alert) {
+  await runOpenTaskDb(`
+    INSERT INTO open_task_watch_alerts (
+      task_id,
+      alert_status,
+      reason,
+      action,
+      summary,
+      responsible_id,
+      responsible_name,
+      group_id,
+      group_name,
+      task_link,
+      sent_at,
+      ai_result_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `, [
+    alert.task_id,
+    alert.alert_status,
+    alert.reason,
+    alert.action,
+    alert.summary,
+    alert.responsible_id,
+    alert.responsible_name,
+    alert.group_id,
+    alert.group_name,
+    alert.task_link,
+    new Date().toISOString(),
+    JSON.stringify(alert.ai_result),
+  ]);
+}
+
+async function markOpenTaskWatchAlertSent(taskId, alertStatus) {
+  await runOpenTaskDb(`
+    UPDATE open_task_watch_state
+    SET last_alert_sent_at = ?, last_alert_status = ?, updated_at = ?
+    WHERE task_id = ?
+  `, [
+    new Date().toISOString(),
+    alertStatus,
+    new Date().toISOString(),
+    String(taskId),
+  ]);
+}
+
+async function markOpenTaskWatchResolved(taskId, reason) {
+  await runOpenTaskDb(`
+    UPDATE open_task_watch_state
+    SET resolved_at = ?, resolved_reason = ?, updated_at = ?
+    WHERE task_id = ? AND resolved_at IS NULL
+  `, [
+    new Date().toISOString(),
+    reason,
+    new Date().toISOString(),
+    String(taskId),
+  ]);
+}
+
+function isOpenTaskWatchDue(state, now = new Date()) {
+  if (!state) return true;
+  if (state.resolved_at) return false;
+  if (!state.last_recheck_at) return true;
+  return Date.parse(state.last_recheck_at) <= now.getTime();
+}
+
+async function collectOpenTaskWatchContext(taskId) {
+  const { task, comments, commentsSource } = await fetchTaskWithComments(taskId);
+  const filteredComments = filterGemmaComments(comments);
+  const groupId = getGroupIdFromTask(task);
+  const groupName = getGroupNameFromTask(task);
+  const responsibleId = getResponsibleIdFromTask(task);
+  const creatorId = getCreatorIdFromTask(task);
+  const parentId = getParentIdFromTask(task);
+  const timeLogs = await fetchTaskTimeLogs(taskId);
+  const history = await getTaskHistory(taskId);
+
+  if (isTaskClosed(task)) {
+    return { task, skipped: true, reason: 'task_is_closed' };
+  }
+
+  const imageResult = await prepareTaskImages(task, filteredComments, 'openTaskWatch.currentTask');
+  const chatImageResult = await prepareTaskChatImages(task, 'openTaskWatch.currentTask');
+  const images = [...imageResult.images, ...chatImageResult.images].slice(0, AI_MAX_IMAGES);
+  const imageFacts = await extractImageFacts(images, 'открытой задачи', taskId);
+  const audioResult = await prepareTaskChatAudioTranscripts(task, 'openTaskWatch.currentTask');
+  let parentContext = null;
+
+  if (parentId && parentId !== '0') {
+    const { task: parentTask, comments: parentComments, commentsSource: parentCommentsSource } = await fetchTaskWithComments(parentId);
+    const filteredParentComments = filterGemmaComments(parentComments);
+    const parentTimeLogs = await fetchTaskTimeLogs(parentId);
+    const parentHistory = await getTaskHistory(parentId);
+    const parentImageResult = await prepareTaskImages(parentTask, filteredParentComments, 'openTaskWatch.parentTask');
+    const parentChatImageResult = await prepareTaskChatImages(parentTask, 'openTaskWatch.parentTask');
+    const parentImages = [...parentImageResult.images, ...parentChatImageResult.images].slice(0, AI_MAX_IMAGES);
+    const parentImageFacts = await extractImageFacts(parentImages, 'базовой задачи открытой задачи', taskId);
+    const parentAudioResult = await prepareTaskChatAudioTranscripts(parentTask, 'openTaskWatch.parentTask');
+
+    parentContext = {
+      parentId,
+      parentTask,
+      parentComments: filteredParentComments,
+      parentCommentsSource,
+      parentTimeLogs,
+      parentTimeSpentInLogs: getTaskTimeSpent(parentTask),
+      parentDurationFact: getTaskDurationFact(parentTask),
+      parentHistory,
+      parentImages: getImageMetadata(parentImages),
+      parentImageFacts,
+      parentAudioTranscripts: parentAudioResult.transcripts,
+    };
+  }
+
+  return {
+    task,
+    comments: filteredComments,
+    commentsSource,
+    groupId,
+    groupName,
+    responsibleId,
+    creatorId,
+    timeLogs,
+    history,
+    images,
+    imageFacts,
+    audioResult,
+    parentContext,
+  };
+}
+
+async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
+  saveDebug('lastOpenTaskWatchCheck', {
+    status: 'task_analysis_started',
+    task_id: taskId,
+    group_id: candidateInfo.groupId || null,
+    group_name: candidateInfo.groupName || null,
+  });
+
+  const context = await collectOpenTaskWatchContext(taskId);
+  if (context.skipped) {
+    await markOpenTaskWatchResolved(taskId, context.reason);
+    return { task_id: taskId, skipped: true, reason: context.reason };
+  }
+
+  rememberTaskUserNames(context.task);
+  const prompt = buildOpenTaskWatchPrompt({
+    taskId,
+    groupId: context.groupId,
+    responsibleId: context.responsibleId,
+    creatorId: context.creatorId,
+    task: context.task,
+    comments: context.comments,
+    timeLogs: context.timeLogs,
+    history: context.history,
+    images: context.images,
+    imageFacts: context.imageFacts,
+    audioTranscripts: context.audioResult.transcripts,
+    parentContext: context.parentContext,
+  });
+
+  saveDebug('lastOpenTaskWatchCheck', {
+    status: 'task_ai_started',
+    task_id: taskId,
+    group_id: context.groupId || null,
+    group_name: context.groupName || candidateInfo.groupName || null,
+    comments_count: context.comments.length,
+    history_count: context.history.length,
+    images_count: context.images.length,
+    image_facts_found: Boolean(context.imageFacts),
+    audio_transcripts_count: context.audioResult.transcripts.length,
+    parent_found: Boolean(context.parentContext),
+  });
+
+  const aiResponse = await coworkRequest('POST', '/chat/completions', {
+    model: SUMMARY_MODEL_NAME,
+    messages: [{
+      role: 'user',
+      content: prompt,
+    }],
+  });
+  const rawAiResult = normalizeAiContent(aiResponse?.choices?.[0]?.message?.content);
+  if (!rawAiResult) throw new Error('AI model returned empty open task watch result');
+
+  const aiResult = normalizeOpenTaskAiResult(parseAiJsonObject(rawAiResult));
+  const alertStatus = aiResult.needs_attention ? getOpenTaskAlertStatus(aiResult) : null;
+  const nextRecheckAt = getNextRecheckAt(aiResult.recheck_days);
+  const saved = await saveOpenTaskWatchState({
+    task: context.task,
+    groupId: context.groupId || candidateInfo.groupId,
+    groupName: context.groupName || candidateInfo.groupName,
+    aiResult,
+    nextRecheckAt,
+  });
+
+  const result = {
+    ok: true,
+    task_id: taskId,
+    alert_status: alertStatus,
+    needs_attention: aiResult.needs_attention,
+    reason: aiResult.reason,
+    action: aiResult.action,
+    summary: aiResult.summary,
+    recheck_days: aiResult.recheck_days,
+    next_recheck_at: nextRecheckAt,
+    raw_ai_result: rawAiResult,
+    ai_result: aiResult,
+    ...saved,
+  };
+
+  saveDebug('lastOpenTaskWatchCheck', {
+    status: 'task_analysis_completed',
+    ...result,
+  });
+
+  return result;
+}
+
+function buildOpenTaskWatchMessage(alerts) {
+  const statusOrder = [
+    '🟡 Ждет ответа заказчика',
+    '🟠 Ждет ответа от ЭЛРОС',
+    '🔴 Требует решения по актуальности',
+  ];
+  const byStatus = new Map();
+
+  for (const alert of alerts) {
+    if (!byStatus.has(alert.alert_status)) byStatus.set(alert.alert_status, new Map());
+    const byResponsible = byStatus.get(alert.alert_status);
+    const responsibleName = alert.responsible_name || UNKNOWN_USER_NAME;
+    if (!byResponsible.has(responsibleName)) byResponsible.set(responsibleName, new Map());
+    const byGroup = byResponsible.get(responsibleName);
+    const groupName = alert.group_name || `Группа ${alert.group_id || 'без названия'}`;
+    if (!byGroup.has(groupName)) byGroup.set(groupName, []);
+    byGroup.get(groupName).push(alert);
+  }
+
+  const lines = ['Контроль открытых задач:'];
+
+  for (const status of statusOrder) {
+    const byResponsible = byStatus.get(status);
+    if (!byResponsible) continue;
+    lines.push('', `[b]${status}[/b]`);
+
+    for (const [responsibleName, byGroup] of [...byResponsible.entries()].sort(([a], [b]) => a.localeCompare(b, 'ru'))) {
+      lines.push('', `[b]Исполнитель: ${responsibleName}[/b]`);
+
+      for (const [groupName, groupAlerts] of [...byGroup.entries()].sort(([a], [b]) => a.localeCompare(b, 'ru'))) {
+        lines.push(`[b]Группа: ${groupName}[/b]`);
+
+        for (const alert of groupAlerts) {
+          lines.push(`${alert.summary}`);
+          lines.push(`Следующая проверка: ${formatDateForMessage(alert.next_recheck_at)}`);
+          lines.push(alert.task_link);
+        }
+      }
+    }
+  }
+
+  return lines.join('\n').trim();
+}
+
+async function sendOpenTaskWatchReport(alerts) {
+  if (alerts.length === 0) return null;
+
+  const message = buildOpenTaskWatchMessage(alerts);
+  await coworkRequest('POST', `/chats/${ELAPSED_NOTIFICATION_CHAT_ID}/messages`, { message });
+
+  for (const alert of alerts) {
+    await saveOpenTaskWatchAlert(alert);
+    await markOpenTaskWatchAlertSent(alert.task_id, alert.alert_status);
+  }
+
+  saveDebug('lastOpenTaskWatchChatDecision', {
+    sent: true,
+    chat_id: ELAPSED_NOTIFICATION_CHAT_ID,
+    alerts_count: alerts.length,
+    task_ids: alerts.map(alert => alert.task_id),
+  });
+
+  return message;
+}
+
+async function resolveOpenTaskWatchStates(candidateIds) {
+  const candidateSet = new Set(candidateIds.map(String));
+  const states = await getUnresolvedOpenTaskWatchStates();
+  let resolved = 0;
+
+  for (const state of states) {
+    if (candidateSet.has(String(state.task_id))) continue;
+
+    try {
+      const response = await coworkRequest('GET', `/tasks/${encodeURIComponent(state.task_id)}`);
+      const task = normalizeTaskPayload(response);
+      const status = getStatusFromTask(task);
+      const groupId = getGroupIdFromTask(task);
+      let groupName = getGroupNameFromTask(task);
+      let archived = getGroupArchivedFromTask(task);
+
+      if (groupId && (!groupName || archived == null)) {
+        const workgroup = await fetchWorkgroup(groupId);
+        groupName ||= getWorkgroupName(workgroup);
+        archived = isWorkgroupArchived(workgroup);
+      }
+
+      if (isTaskClosed(task)) {
+        await markOpenTaskWatchResolved(state.task_id, 'task_closed');
+        resolved += 1;
+      } else if (status !== '2') {
+        await markOpenTaskWatchResolved(state.task_id, `status_changed_to_${status || 'unknown'}`);
+        resolved += 1;
+      } else if (!groupId) {
+        await markOpenTaskWatchResolved(state.task_id, 'no_group');
+        resolved += 1;
+      } else if (isOpenTaskExcludedGroupId(groupId)) {
+        await markOpenTaskWatchResolved(state.task_id, 'excluded_group_id');
+        resolved += 1;
+      } else if (groupName && isCollabGroupName(groupName)) {
+        await markOpenTaskWatchResolved(state.task_id, 'collab_group_name');
+        resolved += 1;
+      } else if (archived) {
+        await markOpenTaskWatchResolved(state.task_id, 'archived_group');
+        resolved += 1;
+      }
+    } catch (error) {
+      log('Open task watch resolve check failed', { task_id: state.task_id, error: error.message });
+    }
+  }
+
+  return resolved;
+}
+
+async function runOpenTaskWatchCheck(options = {}) {
+  if (openTaskCheckInProgress) {
+    const result = {
+      ok: true,
+      skipped: true,
+      reason: 'open_task_check_already_running',
+      started_at: openTaskCheckStartedAt,
+      stage: openTaskCheckStage,
+    };
+    saveDebug('lastOpenTaskWatchCheck', result);
+    return result;
+  }
+
+  const limit = Number.parseInt(options.limit, 10);
+  const maxToAnalyze = Number.isInteger(limit) && limit > 0 ? limit : OPEN_TASK_DEFAULT_LIMIT;
+  openTaskCheckInProgress = true;
+  openTaskCheckStartedAt = new Date().toISOString();
+  openTaskCheckStage = 'fetch_open_tasks';
+
+  try {
+    const rawTasks = await fetchOpenTaskWatchCandidates();
+    openTaskCheckStage = 'filter_candidates';
+    const candidateInfos = [];
+    const skippedByReason = {};
+
+    for (const task of rawTasks) {
+      const info = await getOpenTaskCandidateInfo(task);
+      if (info.included) candidateInfos.push(info);
+      else skippedByReason[info.reason] = (skippedByReason[info.reason] || 0) + 1;
+    }
+
+    openTaskCheckStage = 'resolve_existing_states';
+    const resolvedStates = await resolveOpenTaskWatchStates(candidateInfos.map(info => info.taskId));
+
+    openTaskCheckStage = 'select_due_tasks';
+    const dueInfos = [];
+    for (const info of candidateInfos) {
+      const state = await getOpenTaskWatchState(info.taskId);
+      if (isOpenTaskWatchDue(state)) dueInfos.push(info);
+    }
+
+    const selectedInfos = dueInfos.slice(0, maxToAnalyze);
+    const analyzed = [];
+    const alerts = [];
+    const failed = [];
+
+    for (const [index, info] of selectedInfos.entries()) {
+      openTaskCheckStage = `analyze_task_${index + 1}_of_${selectedInfos.length}`;
+      try {
+        const result = await analyzeOpenTaskWatchTask(info.taskId, info);
+        analyzed.push(result);
+
+        if (result.needs_attention && result.alert_status) {
+          alerts.push(result);
+        }
+      } catch (error) {
+        failed.push({ task_id: info.taskId, error: error.message });
+        saveDebug('lastOpenTaskWatchCheck', {
+          status: 'task_analysis_failed',
+          task_id: info.taskId,
+          error: error.message,
+        });
+      }
+    }
+
+    openTaskCheckStage = 'send_chat_report';
+    const message = await sendOpenTaskWatchReport(alerts);
+    if (!message) {
+      saveDebug('lastOpenTaskWatchChatDecision', {
+        sent: false,
+        reason: 'no_attention_tasks',
+        chat_id: ELAPSED_NOTIFICATION_CHAT_ID,
+        alerts_count: 0,
+      });
+    }
+
+    const result = {
+      ok: true,
+      limit: maxToAnalyze,
+      raw_open_tasks: rawTasks.length,
+      candidates: candidateInfos.length,
+      due_tasks: dueInfos.length,
+      analyzed_tasks: analyzed.length,
+      attention_tasks: alerts.length,
+      failed_tasks: failed.length,
+      resolved_states: resolvedStates,
+      skipped_by_reason: skippedByReason,
+      message_sent: Boolean(message),
+      chat_id: ELAPSED_NOTIFICATION_CHAT_ID,
+      analyzed,
+      failed,
+    };
+
+    saveDebug('lastOpenTaskWatchCheck', result);
+    log('Open task watch check completed', result);
+    return result;
+  } finally {
+    openTaskCheckInProgress = false;
+    openTaskCheckStartedAt = null;
+    openTaskCheckStage = null;
+  }
+}
+
+function queueOpenTaskWatchCheck(options = {}) {
+  if (openTaskCheckInProgress) {
+    return {
+      queued: false,
+      reason: 'open_task_check_already_running',
+      started_at: openTaskCheckStartedAt,
+      stage: openTaskCheckStage,
+    };
+  }
+
+  const queuedAt = new Date().toISOString();
+  saveDebug('lastOpenTaskWatchCheck', {
+    status: 'queued',
+    queued_at: queuedAt,
+    options,
+  });
+
+  setTimeout(() => {
+    runOpenTaskWatchCheck(options)
+      .catch(error => {
+        saveDebug('lastOpenTaskWatchCheck', {
+          status: 'failed',
+          error: error.message,
+        });
+        saveDebug('lastError', { error: error.message });
+        log('Open task watch check failed', { error: error.message });
+      });
+  }, 0);
+
+  return {
+    queued: true,
+    queued_at: queuedAt,
+    limit: options.limit || OPEN_TASK_DEFAULT_LIMIT,
+  };
+}
+
 function queueClosedTaskProcessing(taskId, trigger) {
   const normalizedTaskId = String(taskId);
 
@@ -2867,6 +3739,9 @@ const server = http.createServer(async (req, res) => {
         taskTimeCheckRunning: taskTimeCheckInProgress,
         taskTimeCheckStartedAt,
         taskTimeCheckStage,
+        openTaskCheckRunning: openTaskCheckInProgress,
+        openTaskCheckStartedAt,
+        openTaskCheckStage,
         ...debugState,
       });
       return;
@@ -2913,6 +3788,29 @@ const server = http.createServer(async (req, res) => {
 
       const result = await processOpenTaskNextStep(taskId);
       sendJson(res, result.ok ? 200 : 400, result);
+      return;
+    }
+
+    if ((req.method === 'GET' || req.method === 'POST') && pathname === '/open-tasks-check') {
+      if (req.method === 'POST') await readBody(req);
+      const searchParams = new URL(req.url, `http://${req.headers.host || 'localhost'}`).searchParams;
+      const limit = Number.parseInt(searchParams.get('limit'), 10);
+      const wait = searchParams.get('wait') === 'true';
+      const options = {
+        limit: Number.isInteger(limit) && limit > 0 ? limit : OPEN_TASK_DEFAULT_LIMIT,
+      };
+
+      if (wait) {
+        const result = await runOpenTaskWatchCheck(options);
+        sendJson(res, 200, result);
+        return;
+      }
+
+      const result = queueOpenTaskWatchCheck(options);
+      sendJson(res, result.queued ? 202 : 200, {
+        ok: true,
+        ...result,
+      });
       return;
     }
 
