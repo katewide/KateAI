@@ -1632,6 +1632,17 @@ async function cleanupOldTimeAlerts() {
   return result.changes || 0;
 }
 
+async function cleanupOldTaskTimeState() {
+  const cutoffDate = getLookbackDate(TASK_TIME_LOOKBACK_DAYS);
+
+  const result = await runDb(
+    'DELETE FROM task_time_state WHERE closed_date IS NOT NULL AND closed_date < ?',
+    [cutoffDate]
+  );
+
+  return result.changes || 0;
+}
+
 async function runTaskTimeCheck() {
   if (taskTimeCheckInProgress) {
     const result = {
@@ -1718,6 +1729,9 @@ async function runTaskTimeCheck() {
     taskTimeCheckStage = 'cleanup_old_alerts';
     const deletedOldAlerts = await cleanupOldTimeAlerts();
 
+    taskTimeCheckStage = 'cleanup_old_task_time_state';
+    const deletedOldState = await cleanupOldTaskTimeState();
+
     const visibleChanges = changes.map(({ task, ...change }) => change);
     const uniqueChangedTasks = new Set(changes.map(change => change.taskId)).size;
     const result = {
@@ -1731,6 +1745,7 @@ async function runTaskTimeCheck() {
       changed_time_events: changes.length,
       history_checked_tasks: historyChecked,
       deleted_old_alerts: deletedOldAlerts,
+      deleted_old_task_time_state: deletedOldState,
       chat_id: ELAPSED_NOTIFICATION_CHAT_ID,
       message_sent: Boolean(message),
       changes: visibleChanges,
