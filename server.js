@@ -107,6 +107,30 @@ function getSafeHeaders(headers) {
   return safeHeaders;
 }
 
+function checkPathWritable(targetPath) {
+  try {
+    fs.accessSync(targetPath, fs.constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getStorageDebugInfo() {
+  const dbDir = path.dirname(DB_PATH);
+  return {
+    data_dir: DATA_DIR,
+    db_path: DB_PATH,
+    db_dir,
+    data_dir_exists: fs.existsSync(DATA_DIR),
+    db_dir_exists: fs.existsSync(dbDir),
+    data_dir_writable: fs.existsSync(DATA_DIR) ? checkPathWritable(DATA_DIR) : false,
+    db_dir_writable: fs.existsSync(dbDir) ? checkPathWritable(dbDir) : false,
+    db_file_exists: fs.existsSync(DB_PATH),
+    db_file_writable: fs.existsSync(DB_PATH) ? checkPathWritable(DB_PATH) : null,
+  };
+}
+
 function stringifyForLog(value) {
   if (typeof value === 'string') return value;
   try {
@@ -2757,6 +2781,7 @@ const server = http.createServer(async (req, res) => {
     if ((req.method === 'GET' || req.method === 'HEAD') && pathname === '/debug') {
       sendJson(res, 200, {
         ok: true,
+        storage: getStorageDebugInfo(),
         taskTimeCheckRunning: taskTimeCheckInProgress,
         taskTimeCheckStartedAt,
         taskTimeCheckStage,
