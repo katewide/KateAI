@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'time-check-search-real-status-plain-pagination-2026-08-13-01';
+const APP_VERSION = 'time-check-search-real-status-date-windows-2026-08-13-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -31,6 +31,7 @@ const TASK_TIME_CHECK_ENABLED = process.env.TASK_TIME_CHECK_ENABLED !== 'false';
 const TASK_TIME_CHECK_RUN_ON_START = process.env.TASK_TIME_CHECK_RUN_ON_START === 'true';
 const TASK_TIME_ALERT_RETENTION_DAYS = Number(process.env.TASK_TIME_ALERT_RETENTION_DAYS || 180);
 const TASK_TIME_SEARCH_PAGE_SIZE = Number(process.env.TASK_TIME_SEARCH_PAGE_SIZE || 5000);
+const TASK_TIME_SEARCH_WINDOW_DAYS = Number(process.env.TASK_TIME_SEARCH_WINDOW_DAYS || 14);
 const API_REQUEST_TIMEOUT_MS = Number(process.env.API_REQUEST_TIMEOUT_MS || 60 * 1000);
 const AI_OCR_REQUEST_TIMEOUT_MS = Number(process.env.AI_OCR_REQUEST_TIMEOUT_MS || 30 * 1000);
 const OPEN_TASK_AI_REQUEST_TIMEOUT_MS = Number(process.env.OPEN_TASK_AI_REQUEST_TIMEOUT_MS || 120 * 1000);
@@ -1511,16 +1512,37 @@ function getLookbackDate(days) {
   return date.toISOString();
 }
 
-function buildTaskTimeSearchBody(offset) {
+function buildTaskTimeSearchWindows() {
+  const windows = [];
+  const lookbackStart = new Date(getLookbackDate(TASK_TIME_LOOKBACK_DAYS));
+  let windowTo = new Date();
+
+  while (windowTo > lookbackStart) {
+    const windowFrom = new Date(windowTo);
+    windowFrom.setDate(windowFrom.getDate() - TASK_TIME_SEARCH_WINDOW_DAYS);
+    if (windowFrom < lookbackStart) windowFrom.setTime(lookbackStart.getTime());
+
+    windows.push({
+      from: windowFrom.toISOString(),
+      to: windowTo.toISOString(),
+    });
+
+    windowTo = windowFrom;
+  }
+
+  return windows;
+}
+
+function buildTaskTimeSearchBody(offset, window) {
   return {
-    autoWindow: false,
     sort: 'id',
     order: {
       ID: 'ASC',
     },
     filter: {
       REAL_STATUS: 5,
-      '>=CLOSED_DATE': getLookbackDate(TASK_TIME_LOOKBACK_DAYS),
+      '>=CLOSED_DATE': window.from,
+      '<=CLOSED_DATE': window.to,
     },
     limit: TASK_TIME_SEARCH_PAGE_SIZE,
     offset,
@@ -1538,38 +1560,56 @@ function buildTaskTimeSearchBody(offset) {
 }
 
 async function fetchClosedTasksForTimeCheck() {
-  const tasks = [];
+  const tasksById = new Map();
   const requests = [];
+  const windows = buildTaskTimeSearchWindows();
 
-  for (let offset = 0, page = 1; page <= 200; offset += TASK_TIME_SEARCH_PAGE_SIZE, page += 1) {
-    const body = buildTaskTimeSearchBody(offset);
-    saveDebug('lastTaskTimeCheckRequest', {
-      method: 'POST',
-      path: '/tasks/search',
-      offset,
-      page,
-      body,
-      requests,
-      stage: 'fetch_closed_tasks',
-    });
+  for (const [windowIndex, window] of windows.entries()) {
+    for (let offset = 0, page = 1; page <= 200; offset += TASK_TIME_SEARCH_PAGE_SIZE, page += 1) {
+      const body = buildTaskTimeSearchBody(offset, window);
+      saveDebug('lastTaskTimeCheckRequest', {
+        method: 'POST',
+        path: '/tasks/search',
+        window_index: windowIndex + 1,
+        windows_count: windows.length,
+        window,
+        offset,
+        page,
+        body,
+        requests,
+        stage: 'fetch_closed_tasks',
+      });
 
-    const response = await coworkRequest('POST', '/tasks/search', body);
-    const pageTasks = normalizeTaskListPayload(response);
-    requests.push({
-      offset,
-      page,
-      page_count: pageTasks.length,
-      response_meta: response?.meta || null,
-      total_loaded: tasks.length + pageTasks.length,
-    });
-    tasks.push(...pageTasks);
+      const response = await coworkRequest('POST', '/tasks/search', body);
+      const pageTasks = normalizeTaskListPayload(response);
+      let added = 0;
 
-    const hasMore = Boolean(response?.meta?.hasMore || response?.hasMore);
-    const pageIsFull = pageTasks.length === TASK_TIME_SEARCH_PAGE_SIZE;
-    if (!hasMore && !pageIsFull) break;
+      for (const task of pageTasks) {
+        const taskId = String(task?.id || task?.ID || '');
+        if (!taskId || tasksById.has(taskId)) continue;
+        tasksById.set(taskId, task);
+        added += 1;
+      }
+
+      requests.push({
+        window_index: windowIndex + 1,
+        window_from: window.from,
+        window_to: window.to,
+        offset,
+        page,
+        page_count: pageTasks.length,
+        added_count: added,
+        response_meta: response?.meta || null,
+        total_loaded: tasksById.size,
+      });
+
+      const hasMore = Boolean(response?.meta?.hasMore || response?.hasMore);
+      const pageIsFull = pageTasks.length === TASK_TIME_SEARCH_PAGE_SIZE;
+      if (!hasMore && !pageIsFull) break;
+    }
   }
 
-  return tasks.filter(isTaskClosed);
+  return [...tasksById.values()].filter(isTaskClosed);
 }
 
 function buildTaskLink(task) {
