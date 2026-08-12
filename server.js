@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'open-task-watch-bitrix-webhook-getlist-navpage-3d-2026-08-12-01';
+const APP_VERSION = 'open-task-watch-bitrix-webhook-getlist-start-3d-2026-08-12-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -2837,7 +2837,6 @@ function isWorkgroupArchived(workgroup) {
 }
 
 function buildOpenTaskSearchBody(offset) {
-  const page = Number.isInteger(offset) && offset > 0 ? offset : 1;
   return {
     ORDER: {
       ID: 'ASC',
@@ -2867,9 +2866,7 @@ function buildOpenTaskSearchBody(offset) {
       'TIME_SPENT_IN_LOGS',
       'DURATION_FACT',
     ],
-    NAV_PARAMS: {
-      iNumPage: page,
-    },
+    start: offset,
   };
 }
 
@@ -2893,10 +2890,11 @@ async function fetchOpenTaskWatchCandidates() {
     min_age_days: OPEN_TASK_MIN_AGE_DAYS,
   };
 
-  for (let page = 1; page <= 200; page += 1) {
-    const body = buildOpenTaskSearchBody(page);
+  for (let offset = 0, page = 1; page <= 200; page += 1) {
+    const body = buildOpenTaskSearchBody(offset);
     saveDebug('lastOpenTaskWatchSearch', {
       ...searchDebug,
+      current_offset: offset,
       current_page: page,
       current_body: body,
     });
@@ -2904,6 +2902,7 @@ async function fetchOpenTaskWatchCandidates() {
     const response = await bitrixRestCall('task.items.getlist', body);
     const pageTasks = normalizeTaskListPayload(response);
     searchDebug.requests.push({
+      offset,
       page,
       body,
       response_meta: {
@@ -2919,7 +2918,9 @@ async function fetchOpenTaskWatchCandidates() {
     tasks.push(...pageTasks);
     searchDebug.raw_tasks_from_api = tasks.length;
 
-    if (pageTasks.length < 50) break;
+    const nextOffset = Number.parseInt(response?.next, 10);
+    if (!Number.isFinite(nextOffset) || pageTasks.length === 0) break;
+    offset = nextOffset;
   }
 
   const openTasks = tasks.filter(task => getStatusFromTask(task) === '2');
