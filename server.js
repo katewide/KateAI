@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'open-task-watch-stateless-2026-08-12-01';
+const APP_VERSION = 'open-task-watch-list-tasks-work-status-3d-2026-08-12-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -47,7 +47,7 @@ const AI_MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 const TASK_SUMMARY_FIELD_CODE = 'UF_TASK_TITLE';
 const UNKNOWN_USER_NAME = 'Неизвестный пользователь';
 const OPEN_TASK_MIN_AGE_DAYS = Number(process.env.OPEN_TASK_MIN_AGE_DAYS || 7);
-const OPEN_TASK_DEFAULT_RECHECK_DAYS = Number(process.env.OPEN_TASK_DEFAULT_RECHECK_DAYS || 7);
+const OPEN_TASK_DEFAULT_RECHECK_DAYS = Number(process.env.OPEN_TASK_DEFAULT_RECHECK_DAYS || 3);
 const OPEN_TASK_DEFAULT_LIMIT = Number(process.env.OPEN_TASK_DEFAULT_LIMIT || 10);
 const OPEN_TASK_EXCLUDED_GROUP_IDS = new Set(['0', '12', '58', '92', '140', '276', '376', '490']);
 
@@ -2315,6 +2315,7 @@ ${JSON.stringify(context, null, 2)}
 - action WAIT ставь, если по задаче есть понятный активный следующий шаг или указан будущий срок/звонок/ожидание и сейчас не нужно никого дергать.
 - action REMIND ставь, если 7+ дней нет полезной активности и понятно, чью сторону нужно напомнить.
 - action STALE ставь, если 14+ дней нет полезных апдейтов, непонятно что происходит, клиент не отвечает после попыток связи или участники не добавили новых условий/сроков.
+- action WAIT будет показан в отчете как статус "⚪️ Идет работа", чтобы задача не пропадала из ручной проверки.
 - Для action STALE всегда ставь needs_attention true.
 - Для WAIT_CLIENT + WAIT и WAIT_ELROS + WAIT ставь needs_attention false.
 - Для WAIT_CLIENT + REMIND и WAIT_ELROS + REMIND ставь needs_attention true.
@@ -2352,6 +2353,7 @@ function getOpenTaskAlertStatus(aiResult) {
   if (aiResult.action === 'STALE') return '🔴 Требует решения по актуальности';
   if (aiResult.reason === 'WAIT_CLIENT' && aiResult.action === 'REMIND') return '🟡 Ждет ответа заказчика';
   if (aiResult.reason === 'WAIT_ELROS' && aiResult.action === 'REMIND') return '🟠 Ждет ответа от ЭЛРОС';
+  if (aiResult.action === 'WAIT') return '⚪️ Идет работа';
   return null;
 }
 
@@ -2782,59 +2784,32 @@ function isWorkgroupArchived(workgroup) {
   return ['Y', 'YES', 'TRUE', '1'].includes(String(archived).toUpperCase());
 }
 
-function buildOpenTaskListQuery(offset) {
-  return {
-    filter: {
-      STATUS: 2,
-      '<=CREATED_DATE': getIsoDaysAgo(OPEN_TASK_MIN_AGE_DAYS),
-      '!GROUP_ID': [...OPEN_TASK_EXCLUDED_GROUP_IDS].map(Number),
-    },
-    order: { ID: 'ASC' },
-    limit: 5000,
-    offset,
-    select: [
-      'ID',
-      'TITLE',
-      'STATUS',
-      'GROUP_ID',
-      'CREATED_DATE',
-      'ACTIVITY_DATE',
-      'RESPONSIBLE_ID',
-      'CREATED_BY',
-      'PARENT_ID',
-      'CHAT_ID',
-      'TIME_SPENT_IN_LOGS',
-      'DURATION_FACT',
-      'GROUP',
-    ],
-  };
-}
-
-function buildOpenTaskListControlQuery() {
-  return {
-    filter: {
-      STATUS: 2,
-      '<=CREATED_DATE': getIsoDaysAgo(OPEN_TASK_MIN_AGE_DAYS),
-    },
-    order: { ID: 'ASC' },
-    limit: 5000,
-    offset: 0,
-    select: [
-      'ID',
-      'TITLE',
-      'STATUS',
-      'GROUP_ID',
-      'CREATED_DATE',
-      'ACTIVITY_DATE',
-      'RESPONSIBLE_ID',
-      'CREATED_BY',
-      'PARENT_ID',
-      'CHAT_ID',
-      'TIME_SPENT_IN_LOGS',
-      'DURATION_FACT',
-      'GROUP',
-    ],
-  };
+function buildOpenTaskListPath(offset, includeGroupFilter = true) {
+  const params = new URLSearchParams();
+  params.set('limit', '5000');
+  params.set('offset', String(offset));
+  params.set('sort', 'id');
+  params.set('filter[status]', '2');
+  params.set('filter[createdDate][$lte]', getIsoDaysAgo(OPEN_TASK_MIN_AGE_DAYS));
+  if (includeGroupFilter) {
+    appendParams(params, [...OPEN_TASK_EXCLUDED_GROUP_IDS].map(Number), 'filter[groupId][$nin]');
+  }
+  params.set('select', [
+    'id',
+    'title',
+    'status',
+    'groupId',
+    'createdDate',
+    'activityDate',
+    'responsibleId',
+    'createdBy',
+    'parentId',
+    'chatId',
+    'timeSpentInLogs',
+    'durationFact',
+    'group',
+  ].join(','));
+  return `/tasks?${params.toString()}`;
 }
 
 function isOpenTaskOldEnough(task) {
@@ -2847,8 +2822,8 @@ async function fetchOpenTaskWatchCandidates() {
   const tasks = [];
   const searchDebug = {
     status: 'fetch_open_tasks',
-    method: 'POST',
-    path: '/tasks/search',
+    method: 'GET',
+    path: '/tasks',
     requests: [],
     raw_tasks_from_api: 0,
     status_2_tasks: 0,
@@ -2858,18 +2833,18 @@ async function fetchOpenTaskWatchCandidates() {
   };
 
   for (let offset = 0; ; offset += 5000) {
-    const body = buildOpenTaskListQuery(offset);
+    const path = buildOpenTaskListPath(offset, true);
     saveDebug('lastOpenTaskWatchSearch', {
       ...searchDebug,
       current_offset: offset,
-      current_body: body,
+      current_path: path,
     });
 
-    const response = await coworkRequest('POST', '/tasks/search', body);
+    const response = await coworkRequest('GET', path);
     const pageTasks = normalizeTaskListPayload(response);
     searchDebug.requests.push({
       offset,
-      body,
+      path,
       response_meta: response?.meta || null,
       page_count: pageTasks.length,
       sample_task_ids: pageTasks.slice(0, 20).map(task => String(task?.id || task?.ID || '')),
@@ -2889,8 +2864,8 @@ async function fetchOpenTaskWatchCandidates() {
   searchDebug.old_enough_tasks = oldEnoughTasks.length;
 
   try {
-    const controlBody = buildOpenTaskListControlQuery();
-    const controlResponse = await coworkRequest('POST', '/tasks/search', controlBody);
+    const controlPath = buildOpenTaskListPath(0, false);
+    const controlResponse = await coworkRequest('GET', controlPath);
     const controlTasks = normalizeTaskListPayload(controlResponse);
     const controlGroupCounts = {};
     const controlLocalSkippedByReason = {};
@@ -2914,7 +2889,7 @@ async function fetchOpenTaskWatchCandidates() {
     }
 
     searchDebug.control_without_group_filter = {
-      body: controlBody,
+      path: controlPath,
       response_meta: controlResponse?.meta || null,
       page_count: controlTasks.length,
       local_group_counts: sortOpenTaskGroupCounts(controlGroupCounts),
@@ -3232,16 +3207,15 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
     return { task_id: taskId, skipped: true, reason: context.reason };
   }
 
-  // Тестово отключено: проверяем открытую ветку без отсева групп по названию.
-  // if (isCollabGroupName(context.groupName)) {
-  //   return {
-  //     task_id: taskId,
-  //     skipped: true,
-  //     reason: 'collab_group_name',
-  //     group_id: context.groupId || candidateInfo.groupId || null,
-  //     group_name: context.groupName || candidateInfo.groupName || null,
-  //   };
-  // }
+  if (isCollabGroupName(context.groupName)) {
+    return {
+      task_id: taskId,
+      skipped: true,
+      reason: 'collab_group_name',
+      group_id: context.groupId || candidateInfo.groupId || null,
+      group_name: context.groupName || candidateInfo.groupName || null,
+    };
+  }
 
   rememberTaskUserNames(context.task);
   const prompt = buildOpenTaskWatchPrompt({
@@ -3283,7 +3257,7 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
   if (!rawAiResult) throw new Error('AI model returned empty open task watch result');
 
   const aiResult = normalizeOpenTaskAiResult(parseAiJsonObject(rawAiResult));
-  const alertStatus = aiResult.needs_attention ? getOpenTaskAlertStatus(aiResult) : null;
+  const alertStatus = getOpenTaskAlertStatus(aiResult);
   const nextRecheckAt = getNextRecheckAt(aiResult.recheck_days);
   // Тестово отключено: каждый ручной запуск собирает свежие сведения и не опирается на сохраненную историю проверок.
   // const saved = await saveOpenTaskWatchState({
@@ -3330,6 +3304,7 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
 
 function buildOpenTaskWatchMessage(alerts) {
   const statusOrder = [
+    '⚪️ Идет работа',
     '🟡 Ждет ответа заказчика',
     '🟠 Ждет ответа от ЭЛРОС',
     '🔴 Требует решения по актуальности',
@@ -3495,20 +3470,18 @@ async function runOpenTaskWatchCheck(options = {}) {
     openTaskCheckStage = 'select_due_tasks';
     const dueInfos = [];
     for (const info of candidateInfos) {
-      // Тестово отключено: проверяем открытую ветку без отсева групп по названию.
-      // if (isCollabGroupName(info.groupName)) {
-      //   await markOpenTaskWatchResolved(info.taskId, 'collab_group_name');
-      //   skippedByReason.collab_group_name = (skippedByReason.collab_group_name || 0) + 1;
-      //   skippedExamplesByReason.collab_group_name ||= [];
-      //   if (skippedExamplesByReason.collab_group_name.length < 10) {
-      //     skippedExamplesByReason.collab_group_name.push({
-      //       task_id: info.taskId,
-      //       group_id: info.groupId || null,
-      //       group_name: info.groupName || null,
-      //     });
-      //   }
-      //   continue;
-      // }
+      if (isCollabGroupName(info.groupName)) {
+        skippedByReason.collab_group_name = (skippedByReason.collab_group_name || 0) + 1;
+        skippedExamplesByReason.collab_group_name ||= [];
+        if (skippedExamplesByReason.collab_group_name.length < 10) {
+          skippedExamplesByReason.collab_group_name.push({
+            task_id: info.taskId,
+            group_id: info.groupId || null,
+            group_name: info.groupName || null,
+          });
+        }
+        continue;
+      }
 
       // Тестово отключено: last_recheck_at/resolved_at больше не ограничивают ручную проверку.
       // const state = await getOpenTaskWatchState(info.taskId);
@@ -3527,7 +3500,7 @@ async function runOpenTaskWatchCheck(options = {}) {
         const result = await analyzeOpenTaskWatchTask(info.taskId, info);
         analyzed.push(result);
 
-        if (result.needs_attention && result.alert_status) {
+        if (result.alert_status) {
           alerts.push(result);
         }
       } catch (error) {
