@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'time-check-search-real-status-backfill-2026-08-13-01';
+const APP_VERSION = 'time-check-search-real-status-combined-pagination-2026-08-13-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -30,6 +30,7 @@ const TASK_TIME_CHECK_MINUTE_MSK = Number(process.env.TASK_TIME_CHECK_MINUTE_MSK
 const TASK_TIME_CHECK_ENABLED = process.env.TASK_TIME_CHECK_ENABLED !== 'false';
 const TASK_TIME_CHECK_RUN_ON_START = process.env.TASK_TIME_CHECK_RUN_ON_START === 'true';
 const TASK_TIME_ALERT_RETENTION_DAYS = Number(process.env.TASK_TIME_ALERT_RETENTION_DAYS || 180);
+const TASK_TIME_SEARCH_PAGE_SIZE = Number(process.env.TASK_TIME_SEARCH_PAGE_SIZE || 5000);
 const API_REQUEST_TIMEOUT_MS = Number(process.env.API_REQUEST_TIMEOUT_MS || 60 * 1000);
 const AI_OCR_REQUEST_TIMEOUT_MS = Number(process.env.AI_OCR_REQUEST_TIMEOUT_MS || 30 * 1000);
 const OPEN_TASK_AI_REQUEST_TIMEOUT_MS = Number(process.env.OPEN_TASK_AI_REQUEST_TIMEOUT_MS || 120 * 1000);
@@ -1519,7 +1520,7 @@ function buildTaskTimeSearchBody(offset) {
       REAL_STATUS: 5,
       '>=CLOSED_DATE': getLookbackDate(TASK_TIME_LOOKBACK_DAYS),
     },
-    limit: 5000,
+    limit: TASK_TIME_SEARCH_PAGE_SIZE,
     offset,
     select: [
       'ID',
@@ -1536,8 +1537,9 @@ function buildTaskTimeSearchBody(offset) {
 
 async function fetchClosedTasksForTimeCheck() {
   const tasks = [];
+  const requests = [];
 
-  for (let offset = 0, page = 1; ; offset += 5000, page += 1) {
+  for (let offset = 0, page = 1; page <= 200; offset += TASK_TIME_SEARCH_PAGE_SIZE, page += 1) {
     const body = buildTaskTimeSearchBody(offset);
     saveDebug('lastTaskTimeCheckRequest', {
       method: 'POST',
@@ -1545,15 +1547,24 @@ async function fetchClosedTasksForTimeCheck() {
       offset,
       page,
       body,
+      requests,
       stage: 'fetch_closed_tasks',
     });
 
     const response = await coworkRequest('POST', '/tasks/search', body);
     const pageTasks = normalizeTaskListPayload(response);
+    requests.push({
+      offset,
+      page,
+      page_count: pageTasks.length,
+      response_meta: response?.meta || null,
+      total_loaded: tasks.length + pageTasks.length,
+    });
     tasks.push(...pageTasks);
 
     const hasMore = Boolean(response?.meta?.hasMore || response?.hasMore);
-    if (!hasMore || pageTasks.length === 0) break;
+    const pageIsFull = pageTasks.length === TASK_TIME_SEARCH_PAGE_SIZE;
+    if (!hasMore && !pageIsFull) break;
   }
 
   return tasks.filter(isTaskClosed);
