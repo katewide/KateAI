@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'open-task-watch-search-real-status-no-default-limit-2026-08-12-01';
+const APP_VERSION = 'open-task-watch-search-real-status-task-timeouts-2026-08-12-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -32,6 +32,8 @@ const TASK_TIME_CHECK_RUN_ON_START = process.env.TASK_TIME_CHECK_RUN_ON_START ==
 const TASK_TIME_ALERT_RETENTION_DAYS = Number(process.env.TASK_TIME_ALERT_RETENTION_DAYS || 180);
 const API_REQUEST_TIMEOUT_MS = Number(process.env.API_REQUEST_TIMEOUT_MS || 60 * 1000);
 const AI_OCR_REQUEST_TIMEOUT_MS = Number(process.env.AI_OCR_REQUEST_TIMEOUT_MS || 30 * 1000);
+const OPEN_TASK_AI_REQUEST_TIMEOUT_MS = Number(process.env.OPEN_TASK_AI_REQUEST_TIMEOUT_MS || 120 * 1000);
+const OPEN_TASK_ANALYSIS_TIMEOUT_MS = Number(process.env.OPEN_TASK_ANALYSIS_TIMEOUT_MS || 180 * 1000);
 const MSK_UTC_OFFSET_HOURS = 3;
 const GEMMA_EXCLUDED_GROUP_IDS = new Set(['12', '58', '92', '140', '376', '490']);
 const GEMMA_COMMENT_AUTHOR_ID = String(process.env.GEMMA_COMMENT_AUTHOR_ID || 204);
@@ -2560,13 +2562,19 @@ async function processClosedTask(taskId, options = {}) {
     contextparentID,
   });
 
-  const aiResponse = await coworkRequest('POST', '/chat/completions', {
-    model: SUMMARY_MODEL_NAME,
-    messages: [{
-      role: 'user',
-      content: prompt,
-    }],
-  });
+  const aiResponse = await withTimeout(
+    safePromise(coworkRequest('POST', '/chat/completions', {
+      model: SUMMARY_MODEL_NAME,
+      messages: [{
+        role: 'user',
+        content: prompt,
+      }],
+    }, {
+      timeoutMs: OPEN_TASK_AI_REQUEST_TIMEOUT_MS,
+    })),
+    OPEN_TASK_AI_REQUEST_TIMEOUT_MS,
+    `Open task AI ${taskId}`
+  );
 
   const aiComment = normalizeAiContent(aiResponse?.choices?.[0]?.message?.content);
   if (!aiComment && timeSpentInLogs === 0) {
@@ -3557,7 +3565,11 @@ async function runOpenTaskWatchCheck(options = {}) {
     for (const [index, info] of selectedInfos.entries()) {
       openTaskCheckStage = `analyze_task_${index + 1}_of_${selectedInfos.length}`;
       try {
-        const result = await analyzeOpenTaskWatchTask(info.taskId, info);
+        const result = await withTimeout(
+          safePromise(analyzeOpenTaskWatchTask(info.taskId, info)),
+          OPEN_TASK_ANALYSIS_TIMEOUT_MS,
+          `Open task analysis ${info.taskId}`
+        );
         analyzed.push(result);
 
         if (result.alert_status) {
@@ -3588,6 +3600,8 @@ async function runOpenTaskWatchCheck(options = {}) {
       ok: true,
       limit: maxToAnalyze,
       limit_applied: Boolean(maxToAnalyze),
+      task_analysis_timeout_ms: OPEN_TASK_ANALYSIS_TIMEOUT_MS,
+      ai_request_timeout_ms: OPEN_TASK_AI_REQUEST_TIMEOUT_MS,
       old_enough_open_tasks: rawTasks.length,
       candidates: candidateInfos.length,
       due_tasks: dueInfos.length,
