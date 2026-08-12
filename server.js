@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'open-task-watch-bitrix-webhook-getlist-3d-2026-08-12-01';
+const APP_VERSION = 'open-task-watch-bitrix-webhook-getlist-navpage-3d-2026-08-12-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -2868,7 +2868,6 @@ function buildOpenTaskSearchBody(offset) {
       'DURATION_FACT',
     ],
     NAV_PARAMS: {
-      nPageSize: 50,
       iNumPage: page,
     },
   };
