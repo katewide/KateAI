@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'open-task-watch-list-tasks-work-status-3d-2026-08-12-01';
+const APP_VERSION = 'open-task-watch-list-tasks-local-groups-3d-2026-08-12-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -2784,16 +2784,13 @@ function isWorkgroupArchived(workgroup) {
   return ['Y', 'YES', 'TRUE', '1'].includes(String(archived).toUpperCase());
 }
 
-function buildOpenTaskListPath(offset, includeGroupFilter = true) {
+function buildOpenTaskListPath(offset) {
   const params = new URLSearchParams();
   params.set('limit', '5000');
   params.set('offset', String(offset));
   params.set('sort', 'id');
   params.set('filter[status]', '2');
   params.set('filter[createdDate][$lte]', getIsoDaysAgo(OPEN_TASK_MIN_AGE_DAYS));
-  if (includeGroupFilter) {
-    appendParams(params, [...OPEN_TASK_EXCLUDED_GROUP_IDS].map(Number), 'filter[groupId][$nin]');
-  }
   params.set('select', [
     'id',
     'title',
@@ -2833,7 +2830,7 @@ async function fetchOpenTaskWatchCandidates() {
   };
 
   for (let offset = 0; ; offset += 5000) {
-    const path = buildOpenTaskListPath(offset, true);
+    const path = buildOpenTaskListPath(offset);
     saveDebug('lastOpenTaskWatchSearch', {
       ...searchDebug,
       current_offset: offset,
@@ -2864,7 +2861,7 @@ async function fetchOpenTaskWatchCandidates() {
   searchDebug.old_enough_tasks = oldEnoughTasks.length;
 
   try {
-    const controlPath = buildOpenTaskListPath(0, false);
+    const controlPath = buildOpenTaskListPath(0);
     const controlResponse = await coworkRequest('GET', controlPath);
     const controlTasks = normalizeTaskListPayload(controlResponse);
     const controlGroupCounts = {};
