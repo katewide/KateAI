@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'open-task-watch-search-real-status-task-timeouts-2026-08-12-01';
+const APP_VERSION = 'time-check-search-real-status-backfill-2026-08-13-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -53,6 +53,7 @@ const OPEN_TASK_REMIND_AFTER_DAYS = Number(process.env.OPEN_TASK_REMIND_AFTER_DA
 const OPEN_TASK_STALE_AFTER_DAYS = Number(process.env.OPEN_TASK_STALE_AFTER_DAYS || 14);
 const OPEN_TASK_DEFAULT_RECHECK_DAYS = Number(process.env.OPEN_TASK_DEFAULT_RECHECK_DAYS || 3);
 const OPEN_TASK_DEFAULT_LIMIT = Number(process.env.OPEN_TASK_DEFAULT_LIMIT || 10);
+const OPEN_TASK_REPORT_MAX_MESSAGE_CHARS = Number(process.env.OPEN_TASK_REPORT_MAX_MESSAGE_CHARS || 7000);
 const OPEN_TASK_EXCLUDED_GROUP_IDS = new Set(['0', '12', '58', '92', '140', '276', '376', '490']);
 
 let taskTimeCheckInProgress = false;
@@ -1509,38 +1510,45 @@ function getLookbackDate(days) {
   return date.toISOString();
 }
 
-function buildTaskListQuery(offset) {
-  const params = new URLSearchParams();
-  params.set('limit', '5000');
-  params.set('offset', String(offset));
-  params.set('sort', 'id');
-  params.set('filter[status]', '5');
-  params.set('filter[closedDate][$gte]', getLookbackDate(TASK_TIME_LOOKBACK_DAYS));
-  params.set('select', [
-    'id',
-    'title',
-    'status',
-    'groupId',
-    'closedDate',
-    'timeSpentInLogs',
-    'durationFact',
-  ].join(','));
-  return params.toString();
+function buildTaskTimeSearchBody(offset) {
+  return {
+    order: {
+      ID: 'ASC',
+    },
+    filter: {
+      REAL_STATUS: 5,
+      '>=CLOSED_DATE': getLookbackDate(TASK_TIME_LOOKBACK_DAYS),
+    },
+    limit: 5000,
+    offset,
+    select: [
+      'ID',
+      'TITLE',
+      'STATUS',
+      'REAL_STATUS',
+      'GROUP_ID',
+      'CLOSED_DATE',
+      'TIME_SPENT_IN_LOGS',
+      'DURATION_FACT',
+    ],
+  };
 }
 
 async function fetchClosedTasksForTimeCheck() {
   const tasks = [];
 
-  for (let offset = 0; ; offset += 5000) {
-    const path = `/tasks?${buildTaskListQuery(offset)}`;
+  for (let offset = 0, page = 1; ; offset += 5000, page += 1) {
+    const body = buildTaskTimeSearchBody(offset);
     saveDebug('lastTaskTimeCheckRequest', {
-      method: 'GET',
-      path,
+      method: 'POST',
+      path: '/tasks/search',
       offset,
+      page,
+      body,
       stage: 'fetch_closed_tasks',
     });
 
-    const response = await coworkRequest('GET', path);
+    const response = await coworkRequest('POST', '/tasks/search', body);
     const pageTasks = normalizeTaskListPayload(response);
     tasks.push(...pageTasks);
 
@@ -3415,11 +3423,41 @@ function buildOpenTaskWatchMessage(alerts) {
   return lines.join('\n').trim();
 }
 
+function splitMessageByLines(message, maxChars) {
+  const normalizedMaxChars = Number.isFinite(maxChars) && maxChars > 1000 ? maxChars : 7000;
+  if (message.length <= normalizedMaxChars) return [message];
+
+  const chunks = [];
+  let current = '';
+
+  for (const line of message.split('\n')) {
+    const next = current ? `${current}\n${line}` : line;
+    if (next.length > normalizedMaxChars && current) {
+      chunks.push(current.trim());
+      current = line;
+    } else {
+      current = next;
+    }
+  }
+
+  if (current.trim()) chunks.push(current.trim());
+  if (chunks.length <= 1) return chunks;
+
+  return chunks.map((chunk, index) => {
+    const title = `📈 Контроль открытых задач, часть ${index + 1}/${chunks.length}:`;
+    return chunk.replace(/^📈 Контроль открытых задач:/, title);
+  });
+}
+
 async function sendOpenTaskWatchReport(alerts) {
   if (alerts.length === 0) return null;
 
   const message = buildOpenTaskWatchMessage(alerts);
-  await coworkRequest('POST', `/chats/${ELAPSED_NOTIFICATION_CHAT_ID}/messages`, { message });
+  const messages = splitMessageByLines(message, OPEN_TASK_REPORT_MAX_MESSAGE_CHARS);
+
+  for (const chunk of messages) {
+    await coworkRequest('POST', `/chats/${ELAPSED_NOTIFICATION_CHAT_ID}/messages`, { message: chunk });
+  }
 
   for (const alert of alerts) {
     // Тестово отключено: открытая ветка не пишет историю ручных проверок в базу.
@@ -3431,6 +3469,8 @@ async function sendOpenTaskWatchReport(alerts) {
     sent: true,
     chat_id: ELAPSED_NOTIFICATION_CHAT_ID,
     alerts_count: alerts.length,
+    message_parts: messages.length,
+    message_lengths: messages.map(chunk => chunk.length),
     task_ids: alerts.map(alert => alert.task_id),
   });
 
