@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'open-task-watch-bitrix-webhook-getlist-start-3d-2026-08-12-01';
+const APP_VERSION = 'open-task-watch-search-real-status-3d-2026-08-12-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -19,7 +19,6 @@ const IMAGE_MODEL_NAME = process.env.IMAGE_MODEL_NAME || 'bitrix/bitrixgpt-5.5';
 const WEBHOOK_TOKEN = requireEnv('WEBHOOK_TOKEN');
 const ELAPSED_NOTIFICATION_CHAT_ID = process.env.ELAPSED_NOTIFICATION_CHAT_ID || 'chat42358';
 const BITRIX_PORTAL_URL = process.env.BITRIX_PORTAL_URL || 'https://elros.bitrix24.ru';
-const BITRIX_REST_WEBHOOK_URL = getBitrixRestWebhookUrl();
 const DATA_DIR = process.env.DATA_DIR || (process.env.NODE_ENV === 'production' ? '/data' : __dirname);
 const DB_FILENAME = process.env.DB_FILENAME || 'task_time_logs_v2.db';
 const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, DB_FILENAME);
@@ -51,21 +50,6 @@ const OPEN_TASK_MIN_AGE_DAYS = Number(process.env.OPEN_TASK_MIN_AGE_DAYS || 7);
 const OPEN_TASK_DEFAULT_RECHECK_DAYS = Number(process.env.OPEN_TASK_DEFAULT_RECHECK_DAYS || 3);
 const OPEN_TASK_DEFAULT_LIMIT = Number(process.env.OPEN_TASK_DEFAULT_LIMIT || 10);
 const OPEN_TASK_EXCLUDED_GROUP_IDS = new Set(['0', '12', '58', '92', '140', '276', '376', '490']);
-
-function getBitrixRestWebhookUrl() {
-  const webhookUrl = (
-    process.env.BITRIX_REST_WEBHOOK_URL ||
-    process.env.BITRIX_WEBHOOK_URL ||
-    process.env.WEBHOOK_COMMENT_URL ||
-    ''
-  ).trim();
-
-  if (!webhookUrl) return null;
-
-  return webhookUrl
-    .replace(/\/(?:task\.commentitem\.add|task\.items\.getlist)(?:\.json)?$/i, '')
-    .replace(/\/?$/, '/');
-}
 
 let taskTimeCheckInProgress = false;
 let taskTimeCheckStartedAt = null;
@@ -452,24 +436,6 @@ function coworkRequest(method, path, body, options = {}) {
       'X-Api-Key': API_KEY,
     },
     body: body ? JSON.stringify(body) : undefined,
-    timeoutMs: options.timeoutMs,
-  });
-}
-
-function bitrixRestCall(method, params = {}, options = {}) {
-  if (!BITRIX_REST_WEBHOOK_URL) {
-    throw new Error('Missing required env BITRIX_REST_WEBHOOK_URL');
-  }
-
-  const endpoint = new URL(`${method}.json`, BITRIX_REST_WEBHOOK_URL);
-
-  return requestJson(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-    },
-    body: JSON.stringify(params),
     timeoutMs: options.timeoutMs,
   });
 }
@@ -2838,15 +2804,17 @@ function isWorkgroupArchived(workgroup) {
 
 function buildOpenTaskSearchBody(offset) {
   return {
-    ORDER: {
+    order: {
       ID: 'ASC',
     },
-    FILTER: {
-      STATUS: 2,
+    filter: {
+      REAL_STATUS: 2,
       '<=CREATED_DATE': getIsoDaysAgo(OPEN_TASK_MIN_AGE_DAYS),
       '!GROUP_ID': Array.from(OPEN_TASK_EXCLUDED_GROUP_IDS).map(Number),
     },
-    TASKDATA: [
+    limit: 5000,
+    offset,
+    select: [
       'ID',
       'TITLE',
       'STATUS',
@@ -2865,8 +2833,8 @@ function buildOpenTaskSearchBody(offset) {
       'PARENT_ID',
       'TIME_SPENT_IN_LOGS',
       'DURATION_FACT',
+      'GROUP',
     ],
-    start: offset,
   };
 }
 
@@ -2881,8 +2849,7 @@ async function fetchOpenTaskWatchCandidates() {
   const searchDebug = {
     status: 'fetch_open_tasks',
     method: 'POST',
-    path: 'task.items.getlist',
-    webhook_configured: Boolean(BITRIX_REST_WEBHOOK_URL),
+    path: '/tasks/search',
     requests: [],
     raw_tasks_from_api: 0,
     status_2_tasks: 0,
@@ -2899,7 +2866,7 @@ async function fetchOpenTaskWatchCandidates() {
       current_body: body,
     });
 
-    const response = await bitrixRestCall('task.items.getlist', body);
+    const response = await coworkRequest('POST', '/tasks/search', body);
     const pageTasks = normalizeTaskListPayload(response);
     searchDebug.requests.push({
       offset,
@@ -2918,9 +2885,9 @@ async function fetchOpenTaskWatchCandidates() {
     tasks.push(...pageTasks);
     searchDebug.raw_tasks_from_api = tasks.length;
 
-    const nextOffset = Number.parseInt(response?.next, 10);
-    if (!Number.isFinite(nextOffset) || pageTasks.length === 0) break;
-    offset = nextOffset;
+    const hasMore = Boolean(response?.meta?.hasMore || response?.hasMore);
+    if (!hasMore || pageTasks.length === 0) break;
+    offset += 5000;
   }
 
   const openTasks = tasks.filter(task => getStatusFromTask(task) === '2');
