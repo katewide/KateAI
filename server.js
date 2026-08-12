@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'open-task-watch-list-tasks-local-groups-3d-2026-08-12-01';
+const APP_VERSION = 'open-task-watch-bitrix-webhook-getlist-3d-2026-08-12-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -19,6 +19,7 @@ const IMAGE_MODEL_NAME = process.env.IMAGE_MODEL_NAME || 'bitrix/bitrixgpt-5.5';
 const WEBHOOK_TOKEN = requireEnv('WEBHOOK_TOKEN');
 const ELAPSED_NOTIFICATION_CHAT_ID = process.env.ELAPSED_NOTIFICATION_CHAT_ID || 'chat42358';
 const BITRIX_PORTAL_URL = process.env.BITRIX_PORTAL_URL || 'https://elros.bitrix24.ru';
+const BITRIX_REST_WEBHOOK_URL = getBitrixRestWebhookUrl();
 const DATA_DIR = process.env.DATA_DIR || (process.env.NODE_ENV === 'production' ? '/data' : __dirname);
 const DB_FILENAME = process.env.DB_FILENAME || 'task_time_logs_v2.db';
 const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, DB_FILENAME);
@@ -50,6 +51,21 @@ const OPEN_TASK_MIN_AGE_DAYS = Number(process.env.OPEN_TASK_MIN_AGE_DAYS || 7);
 const OPEN_TASK_DEFAULT_RECHECK_DAYS = Number(process.env.OPEN_TASK_DEFAULT_RECHECK_DAYS || 3);
 const OPEN_TASK_DEFAULT_LIMIT = Number(process.env.OPEN_TASK_DEFAULT_LIMIT || 10);
 const OPEN_TASK_EXCLUDED_GROUP_IDS = new Set(['0', '12', '58', '92', '140', '276', '376', '490']);
+
+function getBitrixRestWebhookUrl() {
+  const webhookUrl = (
+    process.env.BITRIX_REST_WEBHOOK_URL ||
+    process.env.BITRIX_WEBHOOK_URL ||
+    process.env.WEBHOOK_COMMENT_URL ||
+    ''
+  ).trim();
+
+  if (!webhookUrl) return null;
+
+  return webhookUrl
+    .replace(/\/(?:task\.commentitem\.add|task\.items\.getlist)(?:\.json)?$/i, '')
+    .replace(/\/?$/, '/');
+}
 
 let taskTimeCheckInProgress = false;
 let taskTimeCheckStartedAt = null;
@@ -440,6 +456,24 @@ function coworkRequest(method, path, body, options = {}) {
   });
 }
 
+function bitrixRestCall(method, params = {}, options = {}) {
+  if (!BITRIX_REST_WEBHOOK_URL) {
+    throw new Error('Missing required env BITRIX_REST_WEBHOOK_URL');
+  }
+
+  const endpoint = new URL(`${method}.json`, BITRIX_REST_WEBHOOK_URL);
+
+  return requestJson(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify(params),
+    timeoutMs: options.timeoutMs,
+  });
+}
+
 function coworkDownload(path) {
   return requestBuffer(new URL(`/v1${path}`, BASE_URL), {
     method: 'GET',
@@ -633,6 +667,24 @@ function getUserDisplayName(user) {
 
   const fullName = user.fullName || user.FULL_NAME;
   return typeof fullName === 'string' && fullName.trim() ? fullName.trim() : null;
+}
+
+function getTaskPersonName(task, prefix) {
+  const firstName = task?.[`${prefix}_NAME`];
+  const lastName = task?.[`${prefix}_LAST_NAME`];
+  const nameParts = [firstName, lastName]
+    .map(part => String(part || '').trim())
+    .filter(Boolean);
+
+  return nameParts.length ? nameParts.join(' ') : null;
+}
+
+function getResponsibleNameFromTask(task) {
+  return (
+    getUserDisplayName(task?.responsible) ||
+    getTaskPersonName(task, 'RESPONSIBLE') ||
+    null
+  );
 }
 
 function normalizeUserPayload(response) {
@@ -2784,29 +2836,42 @@ function isWorkgroupArchived(workgroup) {
   return ['Y', 'YES', 'TRUE', '1'].includes(String(archived).toUpperCase());
 }
 
-function buildOpenTaskListPath(offset) {
-  const params = new URLSearchParams();
-  params.set('limit', '5000');
-  params.set('offset', String(offset));
-  params.set('sort', 'id');
-  params.set('filter[status]', '2');
-  params.set('filter[createdDate][$lte]', getIsoDaysAgo(OPEN_TASK_MIN_AGE_DAYS));
-  params.set('select', [
-    'id',
-    'title',
-    'status',
-    'groupId',
-    'createdDate',
-    'activityDate',
-    'responsibleId',
-    'createdBy',
-    'parentId',
-    'chatId',
-    'timeSpentInLogs',
-    'durationFact',
-    'group',
-  ].join(','));
-  return `/tasks?${params.toString()}`;
+function buildOpenTaskSearchBody(offset) {
+  const page = Number.isInteger(offset) && offset > 0 ? offset : 1;
+  return {
+    ORDER: {
+      ID: 'ASC',
+    },
+    FILTER: {
+      STATUS: 2,
+      '<=CREATED_DATE': getIsoDaysAgo(OPEN_TASK_MIN_AGE_DAYS),
+      '!GROUP_ID': Array.from(OPEN_TASK_EXCLUDED_GROUP_IDS).map(Number),
+    },
+    TASKDATA: [
+      'ID',
+      'TITLE',
+      'STATUS',
+      'REAL_STATUS',
+      'GROUP_ID',
+      'CREATED_DATE',
+      'ACTIVITY_DATE',
+      'RESPONSIBLE_ID',
+      'RESPONSIBLE_NAME',
+      'RESPONSIBLE_LAST_NAME',
+      'RESPONSIBLE_SECOND_NAME',
+      'CREATED_BY',
+      'CREATED_BY_NAME',
+      'CREATED_BY_LAST_NAME',
+      'CREATED_BY_SECOND_NAME',
+      'PARENT_ID',
+      'TIME_SPENT_IN_LOGS',
+      'DURATION_FACT',
+    ],
+    NAV_PARAMS: {
+      nPageSize: 50,
+      iNumPage: page,
+    },
+  };
 }
 
 function isOpenTaskOldEnough(task) {
@@ -2819,30 +2884,34 @@ async function fetchOpenTaskWatchCandidates() {
   const tasks = [];
   const searchDebug = {
     status: 'fetch_open_tasks',
-    method: 'GET',
-    path: '/tasks',
+    method: 'POST',
+    path: 'task.items.getlist',
+    webhook_configured: Boolean(BITRIX_REST_WEBHOOK_URL),
     requests: [],
     raw_tasks_from_api: 0,
     status_2_tasks: 0,
     old_enough_tasks: 0,
     min_age_days: OPEN_TASK_MIN_AGE_DAYS,
-    control_without_group_filter: null,
   };
 
-  for (let offset = 0; ; offset += 5000) {
-    const path = buildOpenTaskListPath(offset);
+  for (let page = 1; page <= 200; page += 1) {
+    const body = buildOpenTaskSearchBody(page);
     saveDebug('lastOpenTaskWatchSearch', {
       ...searchDebug,
-      current_offset: offset,
-      current_path: path,
+      current_page: page,
+      current_body: body,
     });
 
-    const response = await coworkRequest('GET', path);
+    const response = await bitrixRestCall('task.items.getlist', body);
     const pageTasks = normalizeTaskListPayload(response);
     searchDebug.requests.push({
-      offset,
-      path,
-      response_meta: response?.meta || null,
+      page,
+      body,
+      response_meta: {
+        total: response?.total ?? response?.meta?.total ?? null,
+        next: response?.next ?? null,
+        hasMore: response?.meta?.hasMore ?? null,
+      },
       page_count: pageTasks.length,
       sample_task_ids: pageTasks.slice(0, 20).map(task => String(task?.id || task?.ID || '')),
       sample_group_ids: pageTasks.slice(0, 20).map(task => getGroupIdFromTask(task)),
@@ -2851,62 +2920,13 @@ async function fetchOpenTaskWatchCandidates() {
     tasks.push(...pageTasks);
     searchDebug.raw_tasks_from_api = tasks.length;
 
-    const hasMore = Boolean(response?.meta?.hasMore || response?.hasMore);
-    if (!hasMore || pageTasks.length === 0) break;
+    if (pageTasks.length < 50) break;
   }
 
   const openTasks = tasks.filter(task => getStatusFromTask(task) === '2');
   const oldEnoughTasks = openTasks.filter(isOpenTaskOldEnough);
   searchDebug.status_2_tasks = openTasks.length;
   searchDebug.old_enough_tasks = oldEnoughTasks.length;
-
-  try {
-    const controlPath = buildOpenTaskListPath(0);
-    const controlResponse = await coworkRequest('GET', controlPath);
-    const controlTasks = normalizeTaskListPayload(controlResponse);
-    const controlGroupCounts = {};
-    const controlLocalSkippedByReason = {};
-    const controlLocallyIncludedTasks = [];
-
-    for (const task of controlTasks) {
-      incrementOpenTaskGroupCount(controlGroupCounts, task);
-      const groupId = getGroupIdFromTask(task);
-      let skipReason = null;
-
-      if (getStatusFromTask(task) !== '2') skipReason = 'status_not_2';
-      else if (!isOpenTaskOldEnough(task)) skipReason = 'not_old_enough';
-      else if (!groupId) skipReason = 'no_group';
-      else if (isOpenTaskExcludedGroupId(groupId)) skipReason = 'excluded_group_id';
-
-      if (skipReason) {
-        controlLocalSkippedByReason[skipReason] = (controlLocalSkippedByReason[skipReason] || 0) + 1;
-      } else {
-        controlLocallyIncludedTasks.push(task);
-      }
-    }
-
-    searchDebug.control_without_group_filter = {
-      path: controlPath,
-      response_meta: controlResponse?.meta || null,
-      page_count: controlTasks.length,
-      local_group_counts: sortOpenTaskGroupCounts(controlGroupCounts),
-      locally_included_count: controlLocallyIncludedTasks.length,
-      locally_skipped_by_reason: controlLocalSkippedByReason,
-      locally_included_samples: controlLocallyIncludedTasks.slice(0, 30).map(task => ({
-        task_id: String(task?.id || task?.ID || ''),
-        group_id: getGroupIdFromTask(task),
-        group_name: getGroupNameFromTask(task),
-        created_date: getTaskCreatedDate(task),
-      })),
-      sample_task_ids: controlTasks.slice(0, 20).map(task => String(task?.id || task?.ID || '')),
-      sample_group_ids: controlTasks.slice(0, 20).map(task => getGroupIdFromTask(task)),
-      sample_group_names: controlTasks.slice(0, 20).map(task => getGroupNameFromTask(task)),
-    };
-  } catch (error) {
-    searchDebug.control_without_group_filter = {
-      error: error.message,
-    };
-  }
 
   saveDebug('lastOpenTaskWatchSearch', searchDebug);
 
@@ -2920,8 +2940,20 @@ async function getOpenTaskCandidateInfo(task) {
   if (isOpenTaskExcludedGroupId(groupId)) return { task, taskId, included: false, reason: 'excluded_group_id', groupId };
 
   let groupName = getGroupNameFromTask(task);
+  if (!groupName) {
+    const workgroup = await fetchWorkgroup(groupId);
+    groupName = getWorkgroupName(workgroup);
+  }
 
-  return { task, taskId, included: true, groupId, groupName };
+  return {
+    task,
+    taskId,
+    included: true,
+    groupId,
+    groupName,
+    responsibleId: getResponsibleIdFromTask(task),
+    responsibleName: getResponsibleNameFromTask(task),
+  };
 }
 
 async function checkOpenTaskWatchEligibility(taskId) {
@@ -3128,7 +3160,11 @@ async function collectOpenTaskWatchContext(taskId) {
   const { task, comments, commentsSource } = await fetchTaskWithComments(taskId);
   const filteredComments = filterGemmaComments(comments);
   const groupId = getGroupIdFromTask(task);
-  const groupName = getGroupNameFromTask(task);
+  let groupName = getGroupNameFromTask(task);
+  if (!groupName && groupId) {
+    const workgroup = await fetchWorkgroup(groupId);
+    groupName = getWorkgroupName(workgroup);
+  }
   const responsibleId = getResponsibleIdFromTask(task);
   const creatorId = getCreatorIdFromTask(task);
   const parentId = getParentIdFromTask(task);
@@ -3266,7 +3302,9 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
   // });
 
   const responsibleId = getResponsibleIdFromTask(context.task);
-  const responsibleName = await getUserNameById(responsibleId);
+  const responsibleName = getResponsibleNameFromTask(context.task)
+    || candidateInfo.responsibleName
+    || await getUserNameById(responsibleId);
   const saved = {
     task_id: taskId,
     responsible_id: responsibleId,
