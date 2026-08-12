@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'open-task-watch-search-real-status-movement-policy-2026-08-12-01';
+const APP_VERSION = 'open-task-watch-search-real-status-message-format-2026-08-12-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -3377,23 +3377,28 @@ function buildOpenTaskWatchMessage(alerts) {
     byGroup.get(groupName).push(alert);
   }
 
-  const lines = ['Контроль открытых задач:'];
+  const lines = ['📈 Контроль открытых задач:'];
 
   for (const status of statusOrder) {
     const byResponsible = byStatus.get(status);
     if (!byResponsible) continue;
-    lines.push('', `[b]${status}[/b]`);
+
+    const statusMatch = status.match(/^(\S+)\s+(.+)$/);
+    const statusIcon = statusMatch ? statusMatch[1] : '';
+    const statusText = statusMatch ? statusMatch[2] : status;
+    lines.push('', `${statusIcon} [b]${statusText}[/b]`);
 
     for (const [responsibleName, byGroup] of [...byResponsible.entries()].sort(([a], [b]) => a.localeCompare(b, 'ru'))) {
-      lines.push('', `[b]Исполнитель: ${responsibleName}[/b]`);
+      lines.push('', `[b]${responsibleName}[/b]`);
 
       for (const [groupName, groupAlerts] of [...byGroup.entries()].sort(([a], [b]) => a.localeCompare(b, 'ru'))) {
-        lines.push(`[b]Группа: ${groupName}[/b]`);
+        lines.push('', `[b]${groupName}[/b]`);
 
-        for (const alert of groupAlerts) {
-          lines.push(`${alert.summary}`);
-          lines.push(`Следующая проверка: ${formatDateForMessage(alert.next_recheck_at)}`);
+        for (const [index, alert] of groupAlerts.entries()) {
+          lines.push(`${index + 1}. ${alert.summary}`);
+          lines.push(`[i]Следующая проверка:[/i] ${formatDateForMessage(alert.next_recheck_at)}`);
           lines.push(alert.task_link);
+          if (index < groupAlerts.length - 1) lines.push('');
         }
       }
     }
