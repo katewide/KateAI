@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'open-task-watch-search-real-status-3d-2026-08-12-01';
+const APP_VERSION = 'open-task-watch-search-real-status-movement-policy-2026-08-12-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -47,6 +47,8 @@ const AI_MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 const TASK_SUMMARY_FIELD_CODE = 'UF_TASK_TITLE';
 const UNKNOWN_USER_NAME = 'Неизвестный пользователь';
 const OPEN_TASK_MIN_AGE_DAYS = Number(process.env.OPEN_TASK_MIN_AGE_DAYS || 7);
+const OPEN_TASK_REMIND_AFTER_DAYS = Number(process.env.OPEN_TASK_REMIND_AFTER_DAYS || 7);
+const OPEN_TASK_STALE_AFTER_DAYS = Number(process.env.OPEN_TASK_STALE_AFTER_DAYS || 14);
 const OPEN_TASK_DEFAULT_RECHECK_DAYS = Number(process.env.OPEN_TASK_DEFAULT_RECHECK_DAYS || 3);
 const OPEN_TASK_DEFAULT_LIMIT = Number(process.env.OPEN_TASK_DEFAULT_LIMIT || 10);
 const OPEN_TASK_EXCLUDED_GROUP_IDS = new Set(['0', '12', '58', '92', '140', '276', '376', '490']);
@@ -715,6 +717,16 @@ function getTaskCreatedDate(task) {
 
 function getTaskActivityDate(task) {
   return task?.activityDate || task?.ACTIVITY_DATE || null;
+}
+
+function getTaskLastMovementDate(task) {
+  return (
+    getTaskActivityDate(task) ||
+    task?.changedDate ||
+    task?.CHANGED_DATE ||
+    getTaskCreatedDate(task) ||
+    null
+  );
 }
 
 function getGroupArchivedFromTask(task) {
@@ -2289,8 +2301,9 @@ function buildOpenTaskWatchPrompt({ taskId, groupId, responsibleId, creatorId, t
     responsibleId,
     creatorId,
     minAgeDays: OPEN_TASK_MIN_AGE_DAYS,
+    remindAfterDaysWithoutMovement: OPEN_TASK_REMIND_AFTER_DAYS,
     defaultRecheckDays: OPEN_TASK_DEFAULT_RECHECK_DAYS,
-    staleAfterDaysWithoutUsefulUpdates: 14,
+    staleAfterDaysWithoutUsefulUpdates: OPEN_TASK_STALE_AFTER_DAYS,
     task,
     comments,
     timeLogs,
@@ -2330,9 +2343,10 @@ ${JSON.stringify(context, null, 2)}
 - Если сотрудник описал решение проблемы, результат проверки, настройку или инструкцию для клиента, считай, что это отправлено заказчику и теперь ожидается ответ клиента: reason WAIT_CLIENT.
 - WAIT_CLIENT означает, что следующий шаг или ответ находится на стороне клиента.
 - WAIT_ELROS означает, что следующий шаг находится на стороне ЭЛРОС.
-- action WAIT ставь, если по задаче есть понятный активный следующий шаг или указан будущий срок/звонок/ожидание и сейчас не нужно никого дергать.
-- action REMIND ставь, если 7+ дней нет полезной активности и понятно, чью сторону нужно напомнить.
-- action STALE ставь, если 14+ дней нет полезных апдейтов, непонятно что происходит, клиент не отвечает после попыток связи или участники не добавили новых условий/сроков.
+- action WAIT ставь только если была недавняя полезная активность или явно указан будущий срок/звонок/ожидание, поэтому сейчас не нужно никого дергать.
+- action REMIND ставь, если ${OPEN_TASK_REMIND_AFTER_DAYS}+ дней нет полезной активности и понятно, чью сторону нужно напомнить.
+- action STALE ставь, если ${OPEN_TASK_STALE_AFTER_DAYS}+ дней нет полезных апдейтов, непонятно что происходит, клиент не отвечает после попыток связи или участники не добавили новых условий/сроков.
+- Старые задачи без движения за месяцы или с прошлого года не могут иметь action WAIT.
 - action WAIT будет показан в отчете как статус "⚪️ Идет работа", чтобы задача не пропадала из ручной проверки.
 - Для action STALE всегда ставь needs_attention true.
 - Для WAIT_CLIENT + WAIT и WAIT_ELROS + WAIT ставь needs_attention false.
@@ -2365,6 +2379,35 @@ function normalizeOpenTaskAiResult(value) {
     recheck_days: Number.isInteger(recheckDays) && recheckDays > 0 ? recheckDays : OPEN_TASK_DEFAULT_RECHECK_DAYS,
     needs_attention: needsAttention,
   };
+}
+
+function getDaysSince(dateValue, now = new Date()) {
+  const timestamp = Date.parse(dateValue);
+  if (!Number.isFinite(timestamp)) return null;
+  return Math.floor((now.getTime() - timestamp) / (24 * 60 * 60 * 1000));
+}
+
+function applyOpenTaskMovementPolicy(aiResult, task, now = new Date()) {
+  const lastMovementDate = getTaskLastMovementDate(task);
+  const daysWithoutMovement = getDaysSince(lastMovementDate, now);
+  const adjusted = { ...aiResult };
+  let policyApplied = null;
+
+  if (daysWithoutMovement == null || daysWithoutMovement < OPEN_TASK_REMIND_AFTER_DAYS) {
+    return { aiResult: adjusted, policyApplied, lastMovementDate, daysWithoutMovement };
+  }
+
+  if (daysWithoutMovement >= OPEN_TASK_STALE_AFTER_DAYS && adjusted.action !== 'STALE') {
+    adjusted.action = 'STALE';
+    adjusted.needs_attention = true;
+    policyApplied = 'stale_after_days_without_movement';
+  } else if (adjusted.action === 'WAIT') {
+    adjusted.action = 'REMIND';
+    adjusted.needs_attention = true;
+    policyApplied = 'remind_after_days_without_movement';
+  }
+
+  return { aiResult: adjusted, policyApplied, lastMovementDate, daysWithoutMovement };
 }
 
 function getOpenTaskAlertStatus(aiResult) {
@@ -3256,7 +3299,9 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
   const rawAiResult = normalizeAiContent(aiResponse?.choices?.[0]?.message?.content);
   if (!rawAiResult) throw new Error('AI model returned empty open task watch result');
 
-  const aiResult = normalizeOpenTaskAiResult(parseAiJsonObject(rawAiResult));
+  const rawParsedAiResult = normalizeOpenTaskAiResult(parseAiJsonObject(rawAiResult));
+  const movementPolicy = applyOpenTaskMovementPolicy(rawParsedAiResult, context.task);
+  const aiResult = movementPolicy.aiResult;
   const alertStatus = getOpenTaskAlertStatus(aiResult);
   const nextRecheckAt = getNextRecheckAt(aiResult.recheck_days);
   // Тестово отключено: каждый ручной запуск собирает свежие сведения и не опирается на сохраненную историю проверок.
@@ -3292,7 +3337,15 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
     recheck_days: aiResult.recheck_days,
     next_recheck_at: nextRecheckAt,
     raw_ai_result: rawAiResult,
+    original_ai_result: rawParsedAiResult,
     ai_result: aiResult,
+    movement_policy: {
+      applied: movementPolicy.policyApplied,
+      last_movement_date: movementPolicy.lastMovementDate,
+      days_without_movement: movementPolicy.daysWithoutMovement,
+      remind_after_days: OPEN_TASK_REMIND_AFTER_DAYS,
+      stale_after_days: OPEN_TASK_STALE_AFTER_DAYS,
+    },
     ...saved,
   };
 
