@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'open-task-watch-search-real-status-message-format-2026-08-12-01';
+const APP_VERSION = 'open-task-watch-search-real-status-no-default-limit-2026-08-12-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -3488,7 +3488,7 @@ async function runOpenTaskWatchCheck(options = {}) {
   }
 
   const limit = Number.parseInt(options.limit, 10);
-  const maxToAnalyze = Number.isInteger(limit) && limit > 0 ? limit : OPEN_TASK_DEFAULT_LIMIT;
+  const maxToAnalyze = Number.isInteger(limit) && limit > 0 ? limit : null;
   openTaskCheckInProgress = true;
   openTaskCheckStartedAt = new Date().toISOString();
   openTaskCheckStage = 'fetch_open_tasks';
@@ -3549,7 +3549,7 @@ async function runOpenTaskWatchCheck(options = {}) {
       dueInfos.push(info);
     }
 
-    const selectedInfos = dueInfos.slice(0, maxToAnalyze);
+    const selectedInfos = maxToAnalyze ? dueInfos.slice(0, maxToAnalyze) : dueInfos;
     const analyzed = [];
     const alerts = [];
     const failed = [];
@@ -3587,6 +3587,7 @@ async function runOpenTaskWatchCheck(options = {}) {
     const result = {
       ok: true,
       limit: maxToAnalyze,
+      limit_applied: Boolean(maxToAnalyze),
       old_enough_open_tasks: rawTasks.length,
       candidates: candidateInfos.length,
       due_tasks: dueInfos.length,
@@ -3646,7 +3647,8 @@ function queueOpenTaskWatchCheck(options = {}) {
   return {
     queued: true,
     queued_at: queuedAt,
-    limit: options.limit || OPEN_TASK_DEFAULT_LIMIT,
+    limit: options.limit || null,
+    limit_applied: Boolean(options.limit),
   };
 }
 
@@ -4065,9 +4067,8 @@ const server = http.createServer(async (req, res) => {
       const searchParams = new URL(req.url, `http://${req.headers.host || 'localhost'}`).searchParams;
       const limit = Number.parseInt(searchParams.get('limit'), 10);
       const wait = searchParams.get('wait') === 'true';
-      const options = {
-        limit: Number.isInteger(limit) && limit > 0 ? limit : OPEN_TASK_DEFAULT_LIMIT,
-      };
+      const options = {};
+      if (Number.isInteger(limit) && limit > 0) options.limit = limit;
 
       if (wait) {
         const result = await runOpenTaskWatchCheck(options);
