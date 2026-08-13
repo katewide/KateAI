@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'closed-task-clear-title-when-missing-2026-08-13-01';
+const APP_VERSION = 'open-task-watch-media-step-timeouts-2026-08-13-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -36,6 +36,7 @@ const API_REQUEST_TIMEOUT_MS = Number(process.env.API_REQUEST_TIMEOUT_MS || 60 *
 const AI_OCR_REQUEST_TIMEOUT_MS = Number(process.env.AI_OCR_REQUEST_TIMEOUT_MS || 30 * 1000);
 const OPEN_TASK_AI_REQUEST_TIMEOUT_MS = Number(process.env.OPEN_TASK_AI_REQUEST_TIMEOUT_MS || 120 * 1000);
 const OPEN_TASK_ANALYSIS_TIMEOUT_MS = Number(process.env.OPEN_TASK_ANALYSIS_TIMEOUT_MS || 180 * 1000);
+const OPEN_TASK_MEDIA_STEP_TIMEOUT_MS = Number(process.env.OPEN_TASK_MEDIA_STEP_TIMEOUT_MS || 30 * 1000);
 const MSK_UTC_OFFSET_HOURS = 3;
 const GEMMA_EXCLUDED_GROUP_IDS = new Set(['12', '58', '92', '140', '376', '490']);
 const GEMMA_COMMENT_AUTHOR_ID = String(process.env.GEMMA_COMMENT_AUTHOR_ID || 204);
@@ -2361,7 +2362,7 @@ ${JSON.stringify(context, null, 2)}
 <1-2 предложения: что нужно сделать дальше>`;
 }
 
-function buildOpenTaskWatchPrompt({ taskId, groupId, responsibleId, creatorId, task, comments, timeLogs, history, images, imageFacts, audioTranscripts, parentContext }) {
+function buildOpenTaskWatchPrompt({ taskId, groupId, responsibleId, creatorId, task, comments, timeLogs, history, images, imageFacts, audioTranscripts, mediaWarnings, parentContext }) {
   const context = {
     currentDate: new Date().toISOString(),
     currentTaskId: taskId,
@@ -2381,6 +2382,7 @@ function buildOpenTaskWatchPrompt({ taskId, groupId, responsibleId, creatorId, t
     images: getImageMetadata(images),
     imageFacts,
     audioTranscripts,
+    mediaWarnings,
   };
   const contextparentID = parentContext || null;
 
@@ -3279,7 +3281,32 @@ function sortOpenTaskGroupCounts(counts) {
   return Object.values(counts).sort((a, b) => b.count - a.count);
 }
 
+async function runOpenTaskMediaStep(taskId, label, promise, fallback, warnings) {
+  try {
+    return await withTimeout(
+      safePromise(promise),
+      OPEN_TASK_MEDIA_STEP_TIMEOUT_MS,
+      `Open task media step ${label} for ${taskId}`
+    );
+  } catch (error) {
+    warnings.push({
+      step: label,
+      error: error.message,
+      timeout_ms: OPEN_TASK_MEDIA_STEP_TIMEOUT_MS,
+    });
+    log('Open task media step skipped', {
+      task_id: taskId,
+      step: label,
+      error: error.message,
+    });
+    return fallback;
+  }
+}
+
 async function collectOpenTaskWatchContext(taskId) {
+  const mediaWarnings = [];
+  const emptyImageResult = { candidatesCount: 0, candidates: [], images: [] };
+  const emptyAudioResult = { chatId: null, candidatesCount: 0, candidates: [], transcripts: [] };
   const { task, comments, commentsSource } = await fetchTaskWithComments(taskId);
   const filteredComments = filterGemmaComments(comments);
   const groupId = getGroupIdFromTask(task);
@@ -3298,11 +3325,35 @@ async function collectOpenTaskWatchContext(taskId) {
     return { task, skipped: true, reason: 'task_is_closed' };
   }
 
-  const imageResult = await prepareTaskImages(task, filteredComments, 'openTaskWatch.currentTask');
-  const chatImageResult = await prepareTaskChatImages(task, 'openTaskWatch.currentTask');
+  const imageResult = await runOpenTaskMediaStep(
+    taskId,
+    'current_task_images',
+    prepareTaskImages(task, filteredComments, 'openTaskWatch.currentTask'),
+    emptyImageResult,
+    mediaWarnings
+  );
+  const chatImageResult = await runOpenTaskMediaStep(
+    taskId,
+    'current_chat_images',
+    prepareTaskChatImages(task, 'openTaskWatch.currentTask'),
+    emptyImageResult,
+    mediaWarnings
+  );
   const images = [...imageResult.images, ...chatImageResult.images].slice(0, AI_MAX_IMAGES);
-  const imageFacts = await extractImageFacts(images, 'открытой задачи', taskId);
-  const audioResult = await prepareTaskChatAudioTranscripts(task, 'openTaskWatch.currentTask');
+  const imageFacts = await runOpenTaskMediaStep(
+    taskId,
+    'current_image_ocr',
+    extractImageFacts(images, 'открытой задачи', taskId),
+    '',
+    mediaWarnings
+  );
+  const audioResult = await runOpenTaskMediaStep(
+    taskId,
+    'current_audio_transcripts',
+    prepareTaskChatAudioTranscripts(task, 'openTaskWatch.currentTask'),
+    emptyAudioResult,
+    mediaWarnings
+  );
   let parentContext = null;
 
   if (parentId && parentId !== '0') {
@@ -3310,11 +3361,35 @@ async function collectOpenTaskWatchContext(taskId) {
     const filteredParentComments = filterGemmaComments(parentComments);
     const parentTimeLogs = await fetchTaskTimeLogs(parentId);
     const parentHistory = await getTaskHistory(parentId);
-    const parentImageResult = await prepareTaskImages(parentTask, filteredParentComments, 'openTaskWatch.parentTask');
-    const parentChatImageResult = await prepareTaskChatImages(parentTask, 'openTaskWatch.parentTask');
+    const parentImageResult = await runOpenTaskMediaStep(
+      taskId,
+      'parent_task_images',
+      prepareTaskImages(parentTask, filteredParentComments, 'openTaskWatch.parentTask'),
+      emptyImageResult,
+      mediaWarnings
+    );
+    const parentChatImageResult = await runOpenTaskMediaStep(
+      taskId,
+      'parent_chat_images',
+      prepareTaskChatImages(parentTask, 'openTaskWatch.parentTask'),
+      emptyImageResult,
+      mediaWarnings
+    );
     const parentImages = [...parentImageResult.images, ...parentChatImageResult.images].slice(0, AI_MAX_IMAGES);
-    const parentImageFacts = await extractImageFacts(parentImages, 'базовой задачи открытой задачи', taskId);
-    const parentAudioResult = await prepareTaskChatAudioTranscripts(parentTask, 'openTaskWatch.parentTask');
+    const parentImageFacts = await runOpenTaskMediaStep(
+      taskId,
+      'parent_image_ocr',
+      extractImageFacts(parentImages, 'базовой задачи открытой задачи', taskId),
+      '',
+      mediaWarnings
+    );
+    const parentAudioResult = await runOpenTaskMediaStep(
+      taskId,
+      'parent_audio_transcripts',
+      prepareTaskChatAudioTranscripts(parentTask, 'openTaskWatch.parentTask'),
+      emptyAudioResult,
+      mediaWarnings
+    );
 
     parentContext = {
       parentId,
@@ -3345,6 +3420,7 @@ async function collectOpenTaskWatchContext(taskId) {
     imageFacts,
     audioResult,
     parentContext,
+    mediaWarnings,
   };
 }
 
@@ -3385,6 +3461,7 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
     images: context.images,
     imageFacts: context.imageFacts,
     audioTranscripts: context.audioResult.transcripts,
+    mediaWarnings: context.mediaWarnings,
     parentContext: context.parentContext,
   });
 
@@ -3399,6 +3476,8 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
     image_facts_found: Boolean(context.imageFacts),
     audio_transcripts_count: context.audioResult.transcripts.length,
     parent_found: Boolean(context.parentContext),
+    media_warnings: context.mediaWarnings,
+    media_step_timeout_ms: OPEN_TASK_MEDIA_STEP_TIMEOUT_MS,
   });
 
   const aiResponse = await coworkRequest('POST', '/chat/completions', {
@@ -3445,6 +3524,7 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
       remind_after_days: OPEN_TASK_REMIND_AFTER_DAYS,
       stale_after_days: OPEN_TASK_STALE_AFTER_DAYS,
     },
+    media_warnings: context.mediaWarnings,
     ...saved,
   };
 
@@ -3456,16 +3536,17 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
   return result;
 }
 
-function buildOpenTaskWatchMessage(alerts) {
+function buildOpenTaskWatchMessage(alerts, failed = []) {
   const statusOrder = [
     '⚪️ Идет работа',
     '🟡 Ждет ответа заказчика',
     '🟠 Ждет ответа от ЭЛРОС',
     '🔴 Требует решения по актуальности',
+    '⚫ Не удалось получить статус',
   ];
   const byStatus = new Map();
 
-  for (const alert of alerts) {
+  for (const alert of [...alerts, ...failed]) {
     if (!byStatus.has(alert.alert_status)) byStatus.set(alert.alert_status, new Map());
     const byResponsible = byStatus.get(alert.alert_status);
     const responsibleName = alert.responsible_name || UNKNOWN_USER_NAME;
@@ -3495,7 +3576,9 @@ function buildOpenTaskWatchMessage(alerts) {
 
         for (const [index, alert] of groupAlerts.entries()) {
           lines.push(`${index + 1}. ${alert.summary}`);
-          lines.push(`[i]Следующая проверка:[/i] ${formatDateForMessage(alert.next_recheck_at)}`);
+          if (alert.next_recheck_at) {
+            lines.push(`[i]Следующая проверка:[/i] ${formatDateForMessage(alert.next_recheck_at)}`);
+          }
           lines.push(alert.task_link);
           if (index < groupAlerts.length - 1) lines.push('');
         }
@@ -3532,10 +3615,10 @@ function splitMessageByLines(message, maxChars) {
   });
 }
 
-async function sendOpenTaskWatchReport(alerts) {
-  if (alerts.length === 0) return null;
+async function sendOpenTaskWatchReport(alerts, failed = []) {
+  if (alerts.length === 0 && failed.length === 0) return null;
 
-  const message = buildOpenTaskWatchMessage(alerts);
+  const message = buildOpenTaskWatchMessage(alerts, failed);
   const messages = splitMessageByLines(message, OPEN_TASK_REPORT_MAX_MESSAGE_CHARS);
 
   for (const chunk of messages) {
@@ -3551,9 +3634,10 @@ async function sendOpenTaskWatchReport(alerts) {
     sent: true,
     chat_id: ELAPSED_NOTIFICATION_CHAT_ID,
     alerts_count: alerts.length,
+    failed_count: failed.length,
     message_parts: messages.length,
     message_lengths: messages.map(chunk => chunk.length),
-    task_ids: alerts.map(alert => alert.task_id),
+    task_ids: [...alerts, ...failed].map(alert => alert.task_id),
   });
 
   return message;
@@ -3693,7 +3777,17 @@ async function runOpenTaskWatchCheck(options = {}) {
           alerts.push(result);
         }
       } catch (error) {
-        failed.push({ task_id: info.taskId, error: error.message });
+        failed.push({
+          task_id: info.taskId,
+          alert_status: '⚫ Не удалось получить статус',
+          summary: `Не удалось прочитать задачу: ${error.message}`,
+          error: error.message,
+          responsible_id: info.responsibleId || null,
+          responsible_name: info.responsibleName || UNKNOWN_USER_NAME,
+          group_id: info.groupId || null,
+          group_name: info.groupName || null,
+          task_link: buildTaskLink(info.task),
+        });
         saveDebug('lastOpenTaskWatchCheck', {
           status: 'task_analysis_failed',
           task_id: info.taskId,
@@ -3703,13 +3797,14 @@ async function runOpenTaskWatchCheck(options = {}) {
     }
 
     openTaskCheckStage = 'send_chat_report';
-    const message = await sendOpenTaskWatchReport(alerts);
+    const message = await sendOpenTaskWatchReport(alerts, failed);
     if (!message) {
       saveDebug('lastOpenTaskWatchChatDecision', {
         sent: false,
         reason: 'no_attention_tasks',
         chat_id: ELAPSED_NOTIFICATION_CHAT_ID,
         alerts_count: 0,
+        failed_count: 0,
       });
     }
 
