@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'open-task-watch-compact-status-headings-2026-08-14-01';
+const APP_VERSION = 'remove-open-next-step-preview-2026-08-14-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -79,7 +79,6 @@ const debugState = {
   lastTaskTimeCheck: null,
   lastTaskCloseDecision: null,
   lastClosedTaskProcessing: null,
-  lastOpenTaskNextStep: null,
   lastOpenTaskWatchCheck: null,
   lastOpenTaskWatchSearch: null,
   lastOpenTaskWatchChatDecision: null,
@@ -2310,49 +2309,6 @@ ${JSON.stringify(contextparentID, null, 2)}
 Если информации недостаточно, вместо SUMMARY и TITLE выведи только: INSUFFICIENT_INFORMATION`;
 }
 
-function buildNextStepPrompt({ taskId, groupId, responsibleId, creatorId, task, comments, timeLogs, history, images, imageFacts, audioTranscripts }) {
-  const context = {
-    currentDate: new Date().toISOString(),
-    currentTaskId: taskId,
-    groupId,
-    responsibleId,
-    creatorId,
-    task,
-    comments,
-    timeLogs,
-    timeSpentInLogs: getTaskTimeSpent(task),
-    durationFact: getTaskDurationFact(task),
-    history,
-    images: getImageMetadata(images),
-    imageFacts,
-    audioTranscripts,
-  };
-
-  return `Ты - профессиональный консультант 1С и координатор поддержки. Твоя задача — проанализировать незакрытую задачу и предложить следующий шаг, а не итог выполненных работ.
-
-НИЖЕ ПРИВЕДЕН КОНТЕКСТ ЗАДАЧИ (JSON):
-${JSON.stringify(context, null, 2)}
-
-ПРАВИЛА АНАЛИЗА:
-- Используй только факты из JSON.
-- Не придумывай выполненные работы, договоренности, причины и сроки, если они прямо не подтверждены.
-- Учитывай описание задачи, комментарии, историю изменений, трудозатраты, OCR изображений и расшифровки аудио.
-- Комментарии и история последних действий важнее исходного описания задачи.
-- Если последняя активность по задаче была давно или в JSON явно написано, что сотрудники дважды пытались связаться с заказчиком, выбери статус "🔴 Нет активности".
-- Если из JSON видно, что ЭЛРОС написал клиенту, передал результат, задал уточняющий вопрос или ожидает подтверждения от заказчика, выбери статус "🟡 Ждет ответа заказчика". В следующем шаге предложи напомнить заказчику о задаче.
-- Если из JSON видно, что задача находится на стороне ЭЛРОС, превышен срок, указанный разработчиком в комментарии, или срок отсутствует и нужно уточнить статус и срок, выбери статус "🟠 Ждет ответа от ЭЛРОС". В следующем шаге предложи актуализировать статус и срок выполнения.
-- Если невозможно уверенно определить сторону ожидания, выбери наиболее осторожный статус и объясни, какого факта не хватает.
-
-ФОРМАТ ОТВЕТА:
-[b]СТАТУС:[/b] <ровно один статус из списка: 🟡 Ждет ответа заказчика / 🟠 Ждет ответа от ЭЛРОС / 🔴 Нет активности>
-
-[b]ОБОСНОВАНИЕ:[/b]
-<1-3 предложения: какие факты из JSON подтверждают выбранный статус>
-
-[b]СЛЕДУЮЩИЙ ШАГ:[/b]
-<1-2 предложения: что нужно сделать дальше>`;
-}
-
 function buildOpenTaskWatchPrompt({ taskId, groupId, responsibleId, creatorId, task, comments, timeLogs, history, images, imageFacts, audioTranscripts, mediaWarnings, parentContext }) {
   const context = {
     currentDate: new Date().toISOString(),
@@ -2806,122 +2762,6 @@ async function processClosedTask(taskId, options = {}) {
     raw_ai_comment: aiComment,
     ai_comment: commentToPost,
   };
-}
-
-async function processOpenTaskNextStep(taskId) {
-  saveDebug('lastOpenTaskNextStep', {
-    task_id: taskId,
-    status: 'started',
-  });
-
-  const { task, comments, commentsSource } = await fetchTaskWithComments(taskId);
-  const filteredComments = filterGemmaComments(comments);
-  const groupId = getGroupIdFromTask(task);
-  const groupName = getGroupNameFromTask(task);
-  const responsibleId = getResponsibleIdFromTask(task);
-  const creatorId = getCreatorIdFromTask(task);
-  const timeLogs = await fetchTaskTimeLogs(taskId);
-  const history = await getTaskHistory(taskId);
-
-  if (isTaskClosed(task)) {
-    return {
-      ok: false,
-      skipped: true,
-      reason: 'task_is_closed',
-      task_id: taskId,
-      status: getStatusFromTask(task),
-    };
-  }
-
-  const imageResult = await prepareTaskImages(task, filteredComments, 'openTask');
-  const chatImageResult = await prepareTaskChatImages(task, 'openTask');
-  const images = [...imageResult.images, ...chatImageResult.images].slice(0, AI_MAX_IMAGES);
-
-  saveDebug('lastOpenTaskNextStep', {
-    task_id: taskId,
-    status: 'images_downloaded_before_ocr',
-    comments_source: commentsSource,
-    group_id: groupId || null,
-    group_name: groupName || null,
-    task_status: getStatusFromTask(task),
-    image_candidates_count: imageResult.candidatesCount + chatImageResult.candidatesCount,
-    images_count: images.length,
-    images: getImageMetadata(images),
-  });
-
-  const imageFacts = await extractImageFacts(images, 'незакрытой задачи', taskId);
-  const audioResult = await prepareTaskChatAudioTranscripts(task, 'openTask');
-
-  saveDebug('lastOpenTaskNextStep', {
-    task_id: taskId,
-    status: 'summary_started',
-    comments_source: commentsSource,
-    group_id: groupId || null,
-    group_name: groupName || null,
-    task_status: getStatusFromTask(task),
-    comments_count: filteredComments.length,
-    time_logs_count: timeLogs.length,
-    history_count: history.length,
-    image_candidates_count: imageResult.candidatesCount + chatImageResult.candidatesCount,
-    images_count: images.length,
-    image_facts_found: Boolean(imageFacts),
-    audio_candidates_count: audioResult.candidatesCount,
-    audio_transcripts_count: audioResult.transcripts.length,
-  });
-
-  const prompt = buildNextStepPrompt({
-    taskId,
-    groupId,
-    responsibleId,
-    creatorId,
-    task,
-    comments: filteredComments,
-    timeLogs,
-    history,
-    images,
-    imageFacts,
-    audioTranscripts: audioResult.transcripts,
-  });
-
-  const aiResponse = await coworkRequest('POST', '/chat/completions', {
-    model: SUMMARY_MODEL_NAME,
-    messages: [{
-      role: 'user',
-      content: prompt,
-    }],
-  });
-  const aiComment = normalizeAiContent(aiResponse?.choices?.[0]?.message?.content);
-  if (!aiComment) throw new Error('AI model returned empty next step');
-
-  const result = {
-    ok: true,
-    task_id: taskId,
-    group_id: groupId || null,
-    group_name: groupName || null,
-    task_status: getStatusFromTask(task),
-    responsible_id: responsibleId,
-    creator_id: creatorId,
-    comments_source: commentsSource,
-    summary_model: SUMMARY_MODEL_NAME,
-    image_model: IMAGE_MODEL_NAME,
-    time_spent_in_logs: getTaskTimeSpent(task),
-    time_logs_count: timeLogs.length,
-    history_count: history.length,
-    ai_images_count: images.length,
-    image_facts_found: Boolean(imageFacts),
-    audio_candidates_count: audioResult.candidatesCount,
-    audio_transcripts_count: audioResult.transcripts.length,
-    raw_ai_comment: aiComment,
-    ai_comment: aiComment,
-  };
-
-  saveDebug('lastOpenTaskNextStep', {
-    task_id: taskId,
-    status: 'completed',
-    ...result,
-  });
-
-  return result;
 }
 
 function normalizeWorkgroupPayload(response) {
@@ -4051,11 +3891,6 @@ function sendAiTestPage(res) {
 	      <button id="run" type="submit">Итог закрытой задачи</button>
 	      <span id="status" class="muted"></span>
 	    </form>
-	    <form id="openTaskForm">
-	      <input id="openTaskId" name="openTaskId" value="184538" inputmode="numeric">
-	      <button id="runOpenTask" type="submit">Следующий шаг</button>
-	      <span id="openTaskStatus" class="muted"></span>
-	    </form>
     <div class="grid">
       <section>
         <h2>Что было бы опубликовано</h2>
@@ -4083,11 +3918,8 @@ function sendAiTestPage(res) {
     }
 
 	    const form = document.getElementById('form');
-	    const openTaskForm = document.getElementById('openTaskForm');
 	    const run = document.getElementById('run');
-	    const runOpenTask = document.getElementById('runOpenTask');
 	    const status = document.getElementById('status');
-	    const openTaskStatus = document.getElementById('openTaskStatus');
 	    const final = document.getElementById('final');
     const raw = document.getElementById('raw');
     const details = document.getElementById('details');
@@ -4131,45 +3963,6 @@ function sendAiTestPage(res) {
       }
 	    });
 
-	    openTaskForm.addEventListener('submit', async (event) => {
-	      event.preventDefault();
-	      runOpenTask.disabled = true;
-	      openTaskStatus.textContent = 'Анализирую...';
-	      final.textContent = '';
-	      raw.textContent = '';
-	      details.textContent = '';
-	      final.className = '';
-
-	      try {
-	        const taskId = document.getElementById('openTaskId').value.trim();
-	        const response = await fetch('/ai-next-step-preview?taskId=' + encodeURIComponent(taskId));
-	        const data = await response.json();
-	        if (!response.ok || !data.ok) throw new Error(renderValue(data.error || data));
-
-	        final.textContent = renderValue(data.ai_comment);
-	        raw.textContent = renderValue(data.raw_ai_comment);
-	        details.textContent = JSON.stringify({
-	          task_id: data.task_id,
-	          group_id: data.group_id,
-	          task_status: data.task_status,
-	          summary_model: data.summary_model,
-	          time_spent_in_logs: data.time_spent_in_logs,
-	          time_logs_count: data.time_logs_count,
-	          history_count: data.history_count,
-	          ai_images_count: data.ai_images_count,
-	          image_facts_found: data.image_facts_found,
-	          audio_candidates_count: data.audio_candidates_count,
-	          audio_transcripts_count: data.audio_transcripts_count,
-	        }, null, 2);
-	        openTaskStatus.textContent = 'Готово';
-	      } catch (error) {
-	        openTaskStatus.textContent = 'Ошибка';
-	        final.textContent = renderValue(error.message || error);
-	        final.className = 'error';
-	      } finally {
-	        runOpenTask.disabled = false;
-	      }
-	    });
 	  </script>
 </body>
 </html>`);
@@ -4308,23 +4101,6 @@ const server = http.createServer(async (req, res) => {
 
       const result = await processClosedTask(taskId, { dryRun: true });
       sendJson(res, 200, result);
-      return;
-    }
-
-    if ((req.method === 'GET' || req.method === 'HEAD') && pathname === '/ai-next-step-preview') {
-      const taskId = new URL(req.url, `http://${req.headers.host || 'localhost'}`).searchParams.get('taskId') || '184538';
-      if (!normalizeId(taskId)) {
-        sendJson(res, 400, { ok: false, error: 'Invalid taskId' });
-        return;
-      }
-
-      if (req.method === 'HEAD') {
-        sendJson(res, 200, { ok: true });
-        return;
-      }
-
-      const result = await processOpenTaskNextStep(taskId);
-      sendJson(res, result.ok ? 200 : 400, result);
       return;
     }
 
