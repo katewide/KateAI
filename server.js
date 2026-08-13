@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'open-task-watch-stateful-schedule-2026-08-13-01';
+const APP_VERSION = 'closed-task-clear-title-when-missing-2026-08-13-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -2691,6 +2691,14 @@ async function processClosedTask(taskId, options = {}) {
           message: insufficientInfoComment,
         });
       }
+      let summaryFieldUpdated = false;
+      let summaryFieldError = null;
+
+      if (!dryRun) {
+        const summaryFieldResult = await updateTaskSummaryField(taskId, '');
+        summaryFieldUpdated = summaryFieldResult.updated;
+        summaryFieldError = summaryFieldResult.error;
+      }
 
       return {
         ok: true,
@@ -2711,8 +2719,11 @@ async function processClosedTask(taskId, options = {}) {
         comment_posted: !dryRun,
         comment_would_be_posted: dryRun,
         summary_field: TASK_SUMMARY_FIELD_CODE,
-        summary_field_updated: false,
-        summary_field_error: null,
+        summary_field_updated: summaryFieldUpdated,
+        summary_field_would_be_updated: dryRun,
+        summary_field_cleared: !dryRun && summaryFieldUpdated,
+        summary_field_would_be_cleared: dryRun,
+        summary_field_error: summaryFieldError,
         generated_title: null,
         raw_ai_comment: aiComment,
         ai_comment: insufficientInfoComment,
@@ -2748,15 +2759,18 @@ async function processClosedTask(taskId, options = {}) {
     });
   }
   const generatedTitle = extractTitleFromAiComment(aiComment);
+  const summaryFieldValue = generatedTitle || '';
   let summaryFieldUpdated = false;
   let summaryFieldCode = TASK_SUMMARY_FIELD_CODE;
   let summaryFieldError = null;
+  let summaryFieldCleared = false;
 
-  if (generatedTitle && !isSummaryOnlyGroup(groupId) && !dryRun) {
-    const summaryFieldResult = await updateTaskSummaryField(taskId, generatedTitle);
+  if (!isSummaryOnlyGroup(groupId) && !dryRun) {
+    const summaryFieldResult = await updateTaskSummaryField(taskId, summaryFieldValue);
     summaryFieldCode = summaryFieldResult.field;
     summaryFieldUpdated = summaryFieldResult.updated;
     summaryFieldError = summaryFieldResult.error;
+    summaryFieldCleared = !generatedTitle && summaryFieldUpdated;
   }
 
   return {
@@ -2778,8 +2792,11 @@ async function processClosedTask(taskId, options = {}) {
     comment_posted: !dryRun,
     comment_would_be_posted: dryRun,
     summary_field: summaryFieldCode,
+    summary_field_value: summaryFieldValue,
     summary_field_updated: summaryFieldUpdated,
-    summary_field_would_be_updated: Boolean(generatedTitle && !isSummaryOnlyGroup(groupId) && dryRun),
+    summary_field_would_be_updated: Boolean(!isSummaryOnlyGroup(groupId) && dryRun),
+    summary_field_cleared: summaryFieldCleared,
+    summary_field_would_be_cleared: Boolean(!generatedTitle && !isSummaryOnlyGroup(groupId) && dryRun),
     summary_field_error: summaryFieldError,
     generated_title: generatedTitle,
     raw_ai_comment: aiComment,
