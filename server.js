@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'time-check-search-real-status-date-windows-2026-08-13-01';
+const APP_VERSION = 'open-task-watch-stateful-schedule-2026-08-13-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -57,6 +57,10 @@ const OPEN_TASK_DEFAULT_RECHECK_DAYS = Number(process.env.OPEN_TASK_DEFAULT_RECH
 const OPEN_TASK_DEFAULT_LIMIT = Number(process.env.OPEN_TASK_DEFAULT_LIMIT || 10);
 const OPEN_TASK_REPORT_MAX_MESSAGE_CHARS = Number(process.env.OPEN_TASK_REPORT_MAX_MESSAGE_CHARS || 7000);
 const OPEN_TASK_EXCLUDED_GROUP_IDS = new Set(['0', '12', '58', '92', '140', '276', '376', '490']);
+const OPEN_TASK_CHECK_HOUR_MSK = Number(process.env.OPEN_TASK_CHECK_HOUR_MSK || 20);
+const OPEN_TASK_CHECK_MINUTE_MSK = Number(process.env.OPEN_TASK_CHECK_MINUTE_MSK || 30);
+const OPEN_TASK_CHECK_ENABLED = process.env.OPEN_TASK_CHECK_ENABLED !== 'false';
+const OPEN_TASK_CHECK_RUN_ON_START = process.env.OPEN_TASK_CHECK_RUN_ON_START === 'true';
 
 let taskTimeCheckInProgress = false;
 let taskTimeCheckStartedAt = null;
@@ -78,6 +82,7 @@ const debugState = {
   lastOpenTaskWatchCheck: null,
   lastOpenTaskWatchSearch: null,
   lastOpenTaskWatchChatDecision: null,
+  nextOpenTaskWatchCheck: null,
   lastTaskImages: null,
   lastImageOcr: null,
   lastError: null,
@@ -2376,13 +2381,16 @@ function buildOpenTaskWatchPrompt({ taskId, groupId, responsibleId, creatorId, t
     images: getImageMetadata(images),
     imageFacts,
     audioTranscripts,
-    parentContext,
   };
+  const contextparentID = parentContext || null;
 
-  return `Ты - координатор поддержки 1С. Твоя задача — проанализировать открытую задачу в статусе "Ждет выполнения" и решить, нужно ли сейчас привлекать внимание.
+  return `Ты - координатор поддержки 1С. Твоя задача — проанализировать сведения открытой задачи в статусе "Ждет выполнения" компании-франчайзи 1С и решить, нужно ли сейчас привлекать внимание.
 
-НИЖЕ ПРИВЕДЕН КОНТЕКСТ ЗАДАЧИ И БАЗОВОЙ ЗАДАЧИ ПРИ НАЛИЧИИ (JSON):
+НИЖЕ ПРИВЕДЕН КОНТЕКСТ ЗАДАЧИ (JSON):
 ${JSON.stringify(context, null, 2)}
+
+НИЖЕ ПРИВЕДЕН КОНТЕКСТ РОДИТЕЛЬСКОЙ ЗАДАЧИ (JSON):
+${JSON.stringify(contextparentID, null, 2)}
 
 ВЕРНИ ТОЛЬКО ВАЛИДНЫЙ JSON БЕЗ MARKDOWN:
 {
@@ -2390,6 +2398,7 @@ ${JSON.stringify(context, null, 2)}
   "summary": "Клиент должен предоставить резервную копию базы.",
   "action": "WAIT",
   "recheck_days": 7,
+  "next_check_date": "2026-08-16",
   "needs_attention": false
 }
 
@@ -2397,6 +2406,7 @@ ${JSON.stringify(context, null, 2)}
 - reason: WAIT_CLIENT или WAIT_ELROS.
 - action: WAIT, REMIND или STALE.
 - recheck_days: целое число дней до следующей проверки.
+- next_check_date: дата следующей проверки в формате YYYY-MM-DD.
 - needs_attention: boolean.
 
 ПРАВИЛА:
@@ -2408,14 +2418,15 @@ ${JSON.stringify(context, null, 2)}
 - WAIT_ELROS означает, что следующий шаг находится на стороне ЭЛРОС.
 - action WAIT ставь только если была недавняя полезная активность или явно указан будущий срок/звонок/ожидание, поэтому сейчас не нужно никого дергать.
 - action REMIND ставь, если ${OPEN_TASK_REMIND_AFTER_DAYS}+ дней нет полезной активности и понятно, чью сторону нужно напомнить.
-- action STALE ставь, если ${OPEN_TASK_STALE_AFTER_DAYS}+ дней нет полезных апдейтов, непонятно что происходит, клиент не отвечает после попыток связи или участники не добавили новых условий/сроков.
+- action STALE ставь, если ${OPEN_TASK_STALE_AFTER_DAYS}+ дней нет полезных апдейтов, непонятно что происходит и на чьей стороне вопрос, клиент не отвечает после попыток связи или участники не добавили новых условий/сроков.
 - Старые задачи без движения за месяцы или с прошлого года не могут иметь action WAIT.
 - action WAIT будет показан в отчете как статус "⚪️ Идет работа", чтобы задача не пропадала из ручной проверки.
 - Для action STALE всегда ставь needs_attention true.
 - Для WAIT_CLIENT + WAIT и WAIT_ELROS + WAIT ставь needs_attention false.
 - Для WAIT_CLIENT + REMIND и WAIT_ELROS + REMIND ставь needs_attention true.
-- Если в задаче прямо указан будущий срок, звонок или отпуск, recheck_days рассчитай от currentDate до первого рабочего дня, когда задачу нужно проверить после этого события. Например, звонок 12.08 — проверить 13.08; отпуск до сентября — проверить 02.09.
-- Если явного срока нет, recheck_days = ${OPEN_TASK_DEFAULT_RECHECK_DAYS}.
+- Проверка задач выполняется ежедневно в 20:30 по МСК. Верни next_check_date — календарную дату следующей проверки.
+- Если в задаче прямо указан будущий срок, звонок или отпуск, next_check_date поставь на первый рабочий день, когда задачу нужно проверить после этого события. Например, звонок 12.08 — проверить 13.08; отпуск до сентября — проверить 02.09.
+- Если явного срока нет, recheck_days = ${OPEN_TASK_DEFAULT_RECHECK_DAYS}, а next_check_date = currentDate + ${OPEN_TASK_DEFAULT_RECHECK_DAYS} дня.
 - summary должен быть одним коротким предложением: что ожидается или почему задача требует внимания.`;
 }
 
@@ -2432,6 +2443,8 @@ function normalizeOpenTaskAiResult(value) {
   const reason = ['WAIT_CLIENT', 'WAIT_ELROS'].includes(value?.reason) ? value.reason : 'WAIT_ELROS';
   const action = ['WAIT', 'REMIND', 'STALE'].includes(value?.action) ? value.action : 'STALE';
   const recheckDays = Number.parseInt(value?.recheck_days, 10);
+  const nextCheckDate = String(value?.next_check_date || value?.next_recheck_date || '').trim();
+  const normalizedNextCheckDate = /^\d{4}-\d{2}-\d{2}$/.test(nextCheckDate) ? nextCheckDate : null;
   const normalizedAction = action === 'STALE' ? 'STALE' : action;
   const needsAttention = normalizedAction === 'STALE' || normalizedAction === 'REMIND';
 
@@ -2440,6 +2453,7 @@ function normalizeOpenTaskAiResult(value) {
     summary: String(value?.summary || '').trim() || 'Нужно уточнить актуальное состояние задачи.',
     action: normalizedAction,
     recheck_days: Number.isInteger(recheckDays) && recheckDays > 0 ? recheckDays : OPEN_TASK_DEFAULT_RECHECK_DAYS,
+    next_check_date: normalizedNextCheckDate,
     needs_attention: needsAttention,
   };
 }
@@ -2487,10 +2501,18 @@ function getIsoDaysAgo(days) {
   return date.toISOString();
 }
 
-function getNextRecheckAt(recheckDays) {
-  const date = new Date();
-  date.setDate(date.getDate() + recheckDays);
-  return date.toISOString();
+function getNextRecheckAt(recheckDays, nextCheckDate = null) {
+  const rawDate = String(nextCheckDate || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
+    return `${rawDate}T17:30:00.000Z`;
+  }
+
+  const mskDate = new Date(Date.now() + MSK_UTC_OFFSET_HOURS * 60 * 60 * 1000);
+  mskDate.setUTCDate(mskDate.getUTCDate() + recheckDays);
+  const year = mskDate.getUTCFullYear();
+  const month = String(mskDate.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(mskDate.getUTCDate()).padStart(2, '0');
+  return `${year}-${month}-${day}T17:30:00.000Z`;
 }
 
 function formatDateForMessage(isoDate) {
@@ -3204,15 +3226,20 @@ async function markOpenTaskWatchResolved(taskId, reason) {
   ]);
 }
 
+async function deleteOpenTaskWatchState(taskId) {
+  await runOpenTaskDb(
+    'DELETE FROM open_task_watch_state WHERE task_id = ?',
+    [String(taskId)]
+  );
+}
+
 function isOpenTaskWatchDue(state, now = new Date()) {
   if (!state) return true;
-  if (state.resolved_at && state.resolved_reason === 'collab_group_name') return true;
   if (state.resolved_at) return false;
-  // Ручная проверка открытых задач должна повторно анализировать уже найденные задачи.
-  // Иначе сохраненный last_recheck_at скрывает их из ai-test/debug до следующей даты.
-  return true;
-  // if (!state.last_recheck_at) return true;
-  // return Date.parse(state.last_recheck_at) <= now.getTime();
+  if (!state.last_recheck_at) return true;
+  const nextRecheckAt = Date.parse(state.last_recheck_at);
+  if (!Number.isFinite(nextRecheckAt)) return true;
+  return nextRecheckAt <= now.getTime();
 }
 
 function incrementOpenTaskGroupCount(counts, taskOrInfo) {
@@ -3314,8 +3341,7 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
 
   const context = await collectOpenTaskWatchContext(taskId);
   if (context.skipped) {
-    // Тестово отключено: открытая ветка больше не ведет состояние проверки в базе.
-    // await markOpenTaskWatchResolved(taskId, context.reason);
+    await deleteOpenTaskWatchState(taskId);
     return { task_id: taskId, skipped: true, reason: context.reason };
   }
 
@@ -3372,28 +3398,14 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
   const movementPolicy = applyOpenTaskMovementPolicy(rawParsedAiResult, context.task);
   const aiResult = movementPolicy.aiResult;
   const alertStatus = getOpenTaskAlertStatus(aiResult);
-  const nextRecheckAt = getNextRecheckAt(aiResult.recheck_days);
-  // Тестово отключено: каждый ручной запуск собирает свежие сведения и не опирается на сохраненную историю проверок.
-  // const saved = await saveOpenTaskWatchState({
-  //   task: context.task,
-  //   groupId: context.groupId || candidateInfo.groupId,
-  //   groupName: context.groupName || candidateInfo.groupName,
-  //   aiResult,
-  //   nextRecheckAt,
-  // });
-
-  const responsibleId = getResponsibleIdFromTask(context.task);
-  const responsibleName = getResponsibleNameFromTask(context.task)
-    || candidateInfo.responsibleName
-    || await getUserNameById(responsibleId);
-  const saved = {
-    task_id: taskId,
-    responsible_id: responsibleId,
-    responsible_name: responsibleName || (responsibleId ? `Пользователь ${responsibleId}` : UNKNOWN_USER_NAME),
-    group_id: context.groupId || candidateInfo.groupId,
-    group_name: context.groupName || candidateInfo.groupName,
-    task_link: buildTaskLink(context.task),
-  };
+  const nextRecheckAt = getNextRecheckAt(aiResult.recheck_days, aiResult.next_check_date);
+  const saved = await saveOpenTaskWatchState({
+    task: context.task,
+    groupId: context.groupId || candidateInfo.groupId,
+    groupName: context.groupName || candidateInfo.groupName,
+    aiResult,
+    nextRecheckAt,
+  });
 
   const result = {
     ok: true,
@@ -3404,6 +3416,7 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
     action: aiResult.action,
     summary: aiResult.summary,
     recheck_days: aiResult.recheck_days,
+    next_check_date: aiResult.next_check_date,
     next_recheck_at: nextRecheckAt,
     raw_ai_result: rawAiResult,
     original_ai_result: rawParsedAiResult,
@@ -3513,9 +3526,8 @@ async function sendOpenTaskWatchReport(alerts) {
   }
 
   for (const alert of alerts) {
-    // Тестово отключено: открытая ветка не пишет историю ручных проверок в базу.
-    // await saveOpenTaskWatchAlert(alert);
-    // await markOpenTaskWatchAlertSent(alert.task_id, alert.alert_status);
+    await saveOpenTaskWatchAlert(alert);
+    await markOpenTaskWatchAlertSent(alert.task_id, alert.alert_status);
   }
 
   saveDebug('lastOpenTaskWatchChatDecision', {
@@ -3550,22 +3562,15 @@ async function resolveOpenTaskWatchStates(candidateIds) {
         groupName ||= getWorkgroupName(workgroup);
       }
 
-      if (isTaskClosed(task)) {
-        await markOpenTaskWatchResolved(state.task_id, 'task_closed');
+      if (
+        isTaskClosed(task)
+        || status !== '2'
+        || !groupId
+        || isOpenTaskExcludedGroupId(groupId)
+        || isCollabGroupName(groupName)
+      ) {
+        await deleteOpenTaskWatchState(state.task_id);
         resolved += 1;
-      } else if (status !== '2') {
-        await markOpenTaskWatchResolved(state.task_id, `status_changed_to_${status || 'unknown'}`);
-        resolved += 1;
-      } else if (!groupId) {
-        await markOpenTaskWatchResolved(state.task_id, 'no_group');
-        resolved += 1;
-      } else if (isOpenTaskExcludedGroupId(groupId)) {
-        await markOpenTaskWatchResolved(state.task_id, 'excluded_group_id');
-        resolved += 1;
-      // Тестово отключено: проверяем открытую ветку без отсева групп по названию.
-      // } else if (groupName && isCollabGroupName(groupName)) {
-      //   await markOpenTaskWatchResolved(state.task_id, 'collab_group_name');
-      //   resolved += 1;
       }
     } catch (error) {
       log('Open task watch resolve check failed', { task_id: state.task_id, error: error.message });
@@ -3623,13 +3628,16 @@ async function runOpenTaskWatchCheck(options = {}) {
       }
     }
 
+    const activeCandidateIds = candidateInfos
+      .filter(info => !isCollabGroupName(info.groupName))
+      .map(info => info.taskId);
+
     openTaskCheckStage = 'resolve_existing_states';
-    // Тестово отключено: не сверяемся с сохраненным состоянием, каждый запрос работает по актуальному списку из API.
-    // const resolvedStates = await resolveOpenTaskWatchStates(candidateInfos.map(info => info.taskId));
-    const resolvedStates = 0;
+    const resolvedStates = await resolveOpenTaskWatchStates(activeCandidateIds);
 
     openTaskCheckStage = 'select_due_tasks';
     const dueInfos = [];
+    let skippedNotDue = 0;
     for (const info of candidateInfos) {
       if (isCollabGroupName(info.groupName)) {
         skippedByReason.collab_group_name = (skippedByReason.collab_group_name || 0) + 1;
@@ -3644,10 +3652,9 @@ async function runOpenTaskWatchCheck(options = {}) {
         continue;
       }
 
-      // Тестово отключено: last_recheck_at/resolved_at больше не ограничивают ручную проверку.
-      // const state = await getOpenTaskWatchState(info.taskId);
-      // if (isOpenTaskWatchDue(state)) dueInfos.push(info);
-      dueInfos.push(info);
+      const state = await getOpenTaskWatchState(info.taskId);
+      if (isOpenTaskWatchDue(state)) dueInfos.push(info);
+      else skippedNotDue += 1;
     }
 
     const selectedInfos = maxToAnalyze ? dueInfos.slice(0, maxToAnalyze) : dueInfos;
@@ -3698,6 +3705,7 @@ async function runOpenTaskWatchCheck(options = {}) {
       old_enough_open_tasks: rawTasks.length,
       candidates: candidateInfos.length,
       due_tasks: dueInfos.length,
+      skipped_not_due: skippedNotDue,
       analyzed_tasks: analyzed.length,
       attention_tasks: alerts.length,
       failed_tasks: failed.length,
@@ -4098,6 +4106,49 @@ function scheduleNextTaskTimeCheck() {
   }, delayMs);
 }
 
+function getNextOpenTaskWatchCheckDate(now = new Date()) {
+  const scheduledUtcHour = OPEN_TASK_CHECK_HOUR_MSK - MSK_UTC_OFFSET_HOURS;
+  const nextRun = new Date(Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate(),
+    scheduledUtcHour,
+    OPEN_TASK_CHECK_MINUTE_MSK,
+    0,
+    0
+  ));
+
+  if (nextRun <= now) {
+    nextRun.setUTCDate(nextRun.getUTCDate() + 1);
+  }
+
+  return nextRun;
+}
+
+function scheduleNextOpenTaskWatchCheck() {
+  const nextRun = getNextOpenTaskWatchCheckDate();
+  const delayMs = Math.max(0, nextRun.getTime() - Date.now());
+
+  saveDebug('nextOpenTaskWatchCheck', {
+    scheduled_at_utc: nextRun.toISOString(),
+    scheduled_at_msk: `${nextRun.toISOString().slice(0, 10)}T${String(OPEN_TASK_CHECK_HOUR_MSK).padStart(2, '0')}:${String(OPEN_TASK_CHECK_MINUTE_MSK).padStart(2, '0')}:00+03:00`,
+    delay_ms: delayMs,
+  });
+
+  setTimeout(() => {
+    runOpenTaskWatchCheck()
+      .catch(error => {
+        saveDebug('lastOpenTaskWatchCheck', {
+          status: 'failed',
+          error: error.message,
+        });
+        saveDebug('lastError', { error: error.message });
+        log('Open task watch check failed', { error: error.message });
+      })
+      .finally(scheduleNextOpenTaskWatchCheck);
+  }, delayMs);
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const pathname = req.url.split('?')[0];
@@ -4245,9 +4296,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   log(`Server running on port ${PORT}`);
 
-  if (!TASK_TIME_CHECK_ENABLED) return;
-
-  if (TASK_TIME_CHECK_RUN_ON_START) {
+  if (TASK_TIME_CHECK_ENABLED && TASK_TIME_CHECK_RUN_ON_START) {
     setTimeout(() => {
       runTaskTimeCheck().catch(error => {
         saveDebug('lastError', { error: error.message });
@@ -4256,5 +4305,16 @@ server.listen(PORT, () => {
     }, 5000);
   }
 
-  scheduleNextTaskTimeCheck();
+  if (TASK_TIME_CHECK_ENABLED) scheduleNextTaskTimeCheck();
+
+  if (OPEN_TASK_CHECK_ENABLED && OPEN_TASK_CHECK_RUN_ON_START) {
+    setTimeout(() => {
+      runOpenTaskWatchCheck().catch(error => {
+        saveDebug('lastError', { error: error.message });
+        log('Open task watch check failed', { error: error.message });
+      });
+    }, 5000);
+  }
+
+  if (OPEN_TASK_CHECK_ENABLED) scheduleNextOpenTaskWatchCheck();
 });
