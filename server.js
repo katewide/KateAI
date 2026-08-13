@@ -11,7 +11,7 @@ function requireEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
-const APP_VERSION = 'open-task-watch-media-step-timeouts-2026-08-13-01';
+const APP_VERSION = 'open-task-watch-compact-status-headings-2026-08-14-01';
 const BASE_URL = requireEnv('BASE_URL');
 const API_KEY = requireEnv('API_KEY');
 const SUMMARY_MODEL_NAME = process.env.SUMMARY_MODEL_NAME || process.env.MODEL_NAME || 'bitrix/google/gemma-4-26B-A4B-it';
@@ -1812,23 +1812,14 @@ function saveTimeChatDecision(changes, message) {
 }
 
 function buildTimeChangesMessage(changes) {
-  const groups = new Map();
+  const lines = ['🐀 [b]Изменения в закрытых задачах[/b]'];
 
   for (const change of changes) {
     const userName = change.userName || UNKNOWN_USER_NAME;
-    if (!groups.has(userName)) groups.set(userName, []);
-    groups.get(userName).push(change);
-  }
-
-  const lines = ['🐀 ☣️ Время в закрытых задачах изменено:'];
-
-  for (const [userName, userChanges] of groups) {
-    lines.push('', `[b]${userName}[/b]`);
-
-    for (const change of userChanges) {
-      lines.push(`${getChangeIcon(change.diffMinutes)} Задача ${change.taskId} ${getChangeVerb(change.diffMinutes)} на [b]${formatHours(change.diffMinutes)} ч.[/b]`);
-      lines.push(change.taskLink);
-    }
+    lines.push(
+      '',
+      `${getChangeIcon(change.diffMinutes)} Задача [URL=${change.taskLink}]${change.taskId}[/URL] ${getChangeVerb(change.diffMinutes)} на ${formatHours(change.diffMinutes)} ч. | 👤 ${userName}`
+    );
   }
 
   return lines.join('\n').trim();
@@ -2524,6 +2515,17 @@ function formatDateForMessage(isoDate) {
   return date.toLocaleDateString('ru-RU', { timeZone: 'Europe/Moscow' });
 }
 
+function formatShortDateForMessage(isoDate) {
+  if (!isoDate) return 'не указана';
+  const date = new Date(isoDate);
+  if (!Number.isFinite(date.getTime())) return isoDate;
+  return date.toLocaleDateString('ru-RU', {
+    timeZone: 'Europe/Moscow',
+    day: '2-digit',
+    month: '2-digit',
+  });
+}
+
 async function processClosedTask(taskId, options = {}) {
   const dryRun = Boolean(options.dryRun);
   const { task: mainTask, comments: mainComments, commentsSource } = await fetchTaskWithComments(taskId);
@@ -3179,6 +3181,7 @@ async function saveOpenTaskWatchState({ task, groupId, groupName, aiResult, next
 
   return {
     task_id: taskId,
+    task_title: getTaskTitle(task),
     responsible_id: responsibleId,
     responsible_name: responsibleName || (responsibleId ? `Пользователь ${responsibleId}` : UNKNOWN_USER_NAME),
     group_id: groupId,
@@ -3538,52 +3541,44 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
 
 function buildOpenTaskWatchMessage(alerts, failed = []) {
   const statusOrder = [
-    '⚪️ Идет работа',
-    '🟡 Ждет ответа заказчика',
-    '🟠 Ждет ответа от ЭЛРОС',
     '🔴 Требует решения по актуальности',
+    '🟠 Ждет ответа от ЭЛРОС',
+    '🟡 Ждет ответа заказчика',
+    '⚪️ Идет работа',
     '⚫ Не удалось получить статус',
   ];
-  const byStatus = new Map();
+  const statusIndex = new Map(statusOrder.map((status, index) => [status, index]));
+  const sortedAlerts = [...alerts, ...failed].sort((a, b) => {
+    const statusDiff = (statusIndex.get(a.alert_status) ?? 999) - (statusIndex.get(b.alert_status) ?? 999);
+    if (statusDiff !== 0) return statusDiff;
+    const groupDiff = String(a.group_name || '').localeCompare(String(b.group_name || ''), 'ru');
+    if (groupDiff !== 0) return groupDiff;
+    return String(a.task_id || '').localeCompare(String(b.task_id || ''), 'ru', { numeric: true });
+  });
 
-  for (const alert of [...alerts, ...failed]) {
-    if (!byStatus.has(alert.alert_status)) byStatus.set(alert.alert_status, new Map());
-    const byResponsible = byStatus.get(alert.alert_status);
-    const responsibleName = alert.responsible_name || UNKNOWN_USER_NAME;
-    if (!byResponsible.has(responsibleName)) byResponsible.set(responsibleName, new Map());
-    const byGroup = byResponsible.get(responsibleName);
-    const groupName = alert.group_name || `Группа ${alert.group_id || 'без названия'}`;
-    if (!byGroup.has(groupName)) byGroup.set(groupName, []);
-    byGroup.get(groupName).push(alert);
-  }
+  const lines = ['📈 [b]Контроль открытых задач[/b]'];
+  let currentStatus = null;
 
-  const lines = ['📈 Контроль открытых задач:'];
-
-  for (const status of statusOrder) {
-    const byResponsible = byStatus.get(status);
-    if (!byResponsible) continue;
-
-    const statusMatch = status.match(/^(\S+)\s+(.+)$/);
+  for (const alert of sortedAlerts) {
+    const statusMatch = String(alert.alert_status || '').match(/^(\S+)/);
     const statusIcon = statusMatch ? statusMatch[1] : '';
-    const statusText = statusMatch ? statusMatch[2] : status;
-    lines.push('', `${statusIcon} [b]${statusText}[/b]`);
+    const statusText = String(alert.alert_status || '').replace(/^\S+\s*/, '').trim();
+    const taskTitle = alert.task_title || alert.title || 'Без названия';
+    const groupName = alert.group_name || `Группа ${alert.group_id || 'без названия'}`;
+    const responsibleName = alert.responsible_name || UNKNOWN_USER_NAME;
+    const nextCheckDate = alert.next_recheck_at ? formatShortDateForMessage(alert.next_recheck_at) : 'не указана';
 
-    for (const [responsibleName, byGroup] of [...byResponsible.entries()].sort(([a], [b]) => a.localeCompare(b, 'ru'))) {
-      lines.push('', `[b]${responsibleName}[/b]`);
-
-      for (const [groupName, groupAlerts] of [...byGroup.entries()].sort(([a], [b]) => a.localeCompare(b, 'ru'))) {
-        lines.push('', `[b]${groupName}[/b]`);
-
-        for (const [index, alert] of groupAlerts.entries()) {
-          lines.push(`${index + 1}. ${alert.summary}`);
-          if (alert.next_recheck_at) {
-            lines.push(`[i]Следующая проверка:[/i] ${formatDateForMessage(alert.next_recheck_at)}`);
-          }
-          lines.push(alert.task_link);
-          if (index < groupAlerts.length - 1) lines.push('');
-        }
-      }
+    if (alert.alert_status !== currentStatus) {
+      currentStatus = alert.alert_status;
+      lines.push('', `${statusIcon} [i][b]${statusText || currentStatus}[/b][/i]`);
     }
+
+    lines.push(
+      '',
+      `${statusIcon} [URL=${alert.task_link}]${alert.task_id}[/URL] [b]${taskTitle}[/b]`,
+      `🏢 ${groupName} | 👤 ${responsibleName} | 📅 ${nextCheckDate}`,
+      `[i]${alert.summary}[/i]`
+    );
   }
 
   return lines.join('\n').trim();
@@ -3779,6 +3774,7 @@ async function runOpenTaskWatchCheck(options = {}) {
       } catch (error) {
         failed.push({
           task_id: info.taskId,
+          task_title: getTaskTitle(info.task),
           alert_status: '⚫ Не удалось получить статус',
           summary: `Не удалось прочитать задачу: ${error.message}`,
           error: error.message,
