@@ -2085,6 +2085,14 @@ function findClosedStatusChangeNearDoneStage(history, doneStageChange) {
   ) || null;
 }
 
+function findResponsibleChangeNearStage(updateBatch, stageChange) {
+  if (!stageChange) return null;
+
+  return updateBatch.find(change =>
+    normalizeHistoryField(change?.field) === normalizeHistoryField('RESPONSIBLE_ID')
+  ) || null;
+}
+
 function normalizeAiContent(content) {
   if (content == null) return '';
   if (typeof content === 'string') return content.trim();
@@ -3844,9 +3852,14 @@ async function handleWebhook(body) {
   const updateBatch = updateContext.batch;
   const primaryChange = updateBatch[0] || null;
   const primaryField = normalizeHistoryField(primaryChange?.field);
-  const responsibleChange = primaryField === normalizeHistoryField('RESPONSIBLE_ID') ? primaryChange : null;
-  const statusChange = primaryField === normalizeHistoryField('STATUS') ? primaryChange : null;
+  const stageChange = primaryField === normalizeHistoryField('STAGE') ? primaryChange : null;
   const doneStageChange = isDoneStageChange(primaryChange) ? primaryChange : null;
+  const responsibleChange = primaryField === normalizeHistoryField('RESPONSIBLE_ID')
+    ? primaryChange
+    : stageChange
+      ? findResponsibleChangeNearStage(updateBatch, stageChange)
+      : null;
+  const statusChange = primaryField === normalizeHistoryField('STATUS') ? primaryChange : null;
   const actions = [];
 
   // Ветка 1: изменение ответственного, добавление прошлого исполнителя в соисполнители.
