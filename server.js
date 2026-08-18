@@ -2341,7 +2341,7 @@ function buildOpenTaskWatchPrompt({ taskId, groupId, responsibleId, creatorId, t
   };
   const contextparentID = parentContext || null;
 
-  return `Ты - координатор поддержки 1С. Твоя задача — проанализировать сведения открытой задачи в статусе "Ждет выполнения" компании-франчайзи 1С и определить текущее состояние контроля задачи. Используй профессиональную терминологию, принятую в сфере внедрения и сопровождения продуктов 1С, и нейтральные, деловые формулировки.
+  return `Ты - координатор поддержки 1С. Твоя задача — проанализировать сведения открытой задачи в статусе "Ждет выполнения" компании-франчайзи 1С и решить, нужно ли сейчас привлекать внимание. Используй профессиональную терминологию, принятую в сфере внедрения и сопровождения продуктов 1С, и нейтральные, деловые формулировки.
 
 НИЖЕ ПРИВЕДЕН КОНТЕКСТ ЗАДАЧИ (JSON):
 ${JSON.stringify(context, null, 2)}
@@ -2353,7 +2353,6 @@ ${JSON.stringify(contextparentID, null, 2)}
 Основной источник:
 - task
 - comments
-- timeLogs
 - timeSpentInLogs
 - imageFacts
 - audioTranscripts
@@ -2362,7 +2361,6 @@ ${JSON.stringify(contextparentID, null, 2)}
 Дополнительный источник, только если существует:
 - parentContext.task
 - parentContext.comments
-- parentContext.timeLogs
 - parentContext.timeSpentInLogs
 - parentContext.imageFacts
 - parentContext.audioTranscripts
@@ -2390,7 +2388,7 @@ ${JSON.stringify(contextparentID, null, 2)}
   "summary": "Клиент должен предоставить резервную копию базы.",
   "action": "WAIT",
   "recheck_days": 3,
-  "next_check_date": "2026-08-21",
+  "next_check_date": "2026-08-18",
   "needs_attention": false
 }
 
@@ -2398,18 +2396,14 @@ ${JSON.stringify(contextparentID, null, 2)}
 
 reason: WAIT_CLIENT или WAIT_ELROS.
 - WAIT_CLIENT ставь только если из JSON однозначно следует, что следующий ответ, решение, данные, подтверждение или действие ожидаются от заказчика.
-- WAIT_ELROS ставь во всех остальных случаях.
-- Если следующий шаг на стороне ЭЛРОС, ставь WAIT_ELROS.
+- Во всех остальных случаях ставь WAIT_ELROS.
 - Если непонятно, на чьей стороне следующий шаг, ставь WAIT_ELROS.
 
 action: WAIT, REMIND или STALE.
-Определи дату последней значимой активности по comments, timeLogs и history.
-
-- WAIT ставь, если последняя значимая активность была за последние 3 календарных дня включительно.
-- REMIND ставь, если последняя значимая активность была больше 3, но меньше ${OPEN_TASK_STALE_AFTER_DAYS} календарных дней назад.
-- STALE ставь, если последняя значимая активность была ${OPEN_TASK_STALE_AFTER_DAYS} календарных дней назад или раньше.
-- Не ставь STALE раньше ${OPEN_TASK_STALE_AFTER_DAYS} календарных дней с момента последней значимой активности.
-- Не ставь WAIT, если последняя значимая активность была больше 3 календарных дней назад.
+- WAIT ставь, если за последние 3 календарных дня есть значимая активность и по JSON явно видно, что по задаче идет активная работа.
+- REMIND ставь, если за последние 3 календарных дня нет значимой активности, но по задаче еще понятно, что ожидается и на чьей стороне следующий шаг.
+- STALE ставь, если за последние ${OPEN_TASK_STALE_AFTER_DAYS} календарных дней нет значимой активности, непонятно, что происходит и на чьей стороне вопрос, заказчик не отвечает после попыток связи или участники не добавили новых условий, сроков или содержательных обновлений.
+- STALE ставь независимо от будущих сроков, если из JSON видно, что по задаче нет значимой активности ${OPEN_TASK_STALE_AFTER_DAYS} календарных дней или больше. Повторный перенос сроков сам по себе не считается значимой активностью, если в JSON нет содержательного результата, нового условия, подтвержденной причины ожидания или следующего действия.
 
 Значимая активность:
 - Комментарий считается значимым только если в нем есть хотя бы один из признаков:
@@ -2422,7 +2416,6 @@ action: WAIT, REMIND или STALE.
   - согласованный следующий шаг.
 - Учет времени считается значимой активностью, если он связан с выполнением работ по задаче.
 - Комментарии вида “напомнили”, “написали еще раз”, “спросили, актуальна ли задача”, “ждем”, “ожидаем ответ”, без признаков из списка выше, не считаются значимой активностью.
-- Комментарии вида “пока не делаем”, “вернемся позже”, “после решения другой задачи уточним актуальность” считаются значимой активностью, если комментарий свежий и из него понятен следующий шаг, новое условие или новый ответ клиента.
 
 recheck_days: целое число дней до следующей проверки.
 - Всегда ставь recheck_days = ${OPEN_TASK_DEFAULT_RECHECK_DAYS}.
@@ -3455,11 +3448,26 @@ function formatOpenTaskReportDate(now = new Date()) {
   return `${values.day} ${values.month} ${values.year}`;
 }
 
-function getOpenTaskReportTitle(now = new Date()) {
-  return `📈 [b]Контроль открытых задач ${formatOpenTaskReportDate(now)}[/b]`;
+function getOpenTaskReportTitle(page = 1, now = new Date()) {
+  const pageSuffix = page > 1 ? ` - ${page}` : '';
+  return `📈 [b]Контроль открытых задач ${formatOpenTaskReportDate(now)}${pageSuffix}[/b]`;
+}
+
+function buildOpenTaskAlertLines(alert, statusIcon) {
+  const taskTitle = alert.task_title || alert.title || 'Без названия';
+  const groupName = alert.group_name || `Группа ${alert.group_id || 'без названия'}`;
+  const responsibleName = alert.responsible_name || UNKNOWN_USER_NAME;
+  const nextCheckDate = alert.next_recheck_at ? formatShortDateForMessage(alert.next_recheck_at) : 'не указана';
+
+  return [
+    `${statusIcon} [URL=${alert.task_link}]${alert.task_id}[/URL] [b]${taskTitle}[/b]`,
+    `🏢 ${groupName} | 👤 ${responsibleName} | 📅 ${nextCheckDate}`,
+    `[i]${alert.summary}[/i]`,
+  ];
 }
 
 function buildOpenTaskWatchMessages(alerts, failed = []) {
+  const tasksPerMessage = 12;
   const statusOrder = [
     '🔴 Требует решения по актуальности',
     '🟠 Ждет ответа от ЭЛРОС',
@@ -3484,67 +3492,31 @@ function buildOpenTaskWatchMessages(alerts, failed = []) {
     const statusMatch = String(status || '').match(/^(\S+)/);
     const statusIcon = statusMatch ? statusMatch[1] : '';
     const statusText = String(status || '').replace(/^\S+\s*/, '').trim();
-    const lines = [
-      getOpenTaskReportTitle(),
-      '',
-      `${statusIcon} [i][b]${statusText || status}[/b][/i]`,
-    ];
 
-    for (const alert of statusAlerts) {
-      const taskTitle = alert.task_title || alert.title || 'Без названия';
-      const groupName = alert.group_name || `Группа ${alert.group_id || 'без названия'}`;
-      const responsibleName = alert.responsible_name || UNKNOWN_USER_NAME;
-      const nextCheckDate = alert.next_recheck_at ? formatShortDateForMessage(alert.next_recheck_at) : 'не указана';
+    for (let index = 0; index < statusAlerts.length; index += tasksPerMessage) {
+      const page = Math.floor(index / tasksPerMessage) + 1;
+      const pageAlerts = statusAlerts.slice(index, index + tasksPerMessage);
+      const lines = [getOpenTaskReportTitle(page)];
 
-      lines.push(
-        '',
-        `${statusIcon} [URL=${alert.task_link}]${alert.task_id}[/URL] [b]${taskTitle}[/b]`,
-        `🏢 ${groupName} | 👤 ${responsibleName} | 📅 ${nextCheckDate}`,
-        `[i]${alert.summary}[/i]`
-      );
+      if (page === 1) {
+        lines.push('', `${statusIcon} [i][b]${statusText || status}[/b][/i]`);
+      }
+
+      for (const alert of pageAlerts) {
+        lines.push('', ...buildOpenTaskAlertLines(alert, statusIcon));
+      }
+
+      messages.push(lines.join('\n').trim());
     }
-
-    messages.push(lines.join('\n').trim());
   }
 
   return messages;
 }
 
-function splitMessageByLines(message, maxChars, repeatedHeaderLines = []) {
-  const normalizedMaxChars = Number.isFinite(maxChars) && maxChars > 1000 ? maxChars : 7000;
-  if (message.length <= normalizedMaxChars) return [message];
-
-  const chunks = [];
-  let current = '';
-  const header = repeatedHeaderLines.filter(Boolean).join('\n').trim();
-  const bodyLines = header && message.startsWith(header)
-    ? message.slice(header.length).replace(/^\n+/, '').split('\n')
-    : message.split('\n');
-
-  for (const line of bodyLines) {
-    const next = current ? `${current}\n${line}` : line;
-    if (next.length > normalizedMaxChars && current) {
-      chunks.push(current.trim());
-      current = line;
-    } else {
-      current = next;
-    }
-  }
-
-  if (current.trim()) chunks.push(current.trim());
-  if (!header) return chunks;
-
-  return chunks.map(chunk => `${header}\n${chunk}`.trim());
-}
-
 async function sendOpenTaskWatchReport(alerts, failed = []) {
   if (alerts.length === 0 && failed.length === 0) return null;
 
-  const messages = buildOpenTaskWatchMessages(alerts, failed)
-    .flatMap(message => {
-      const headerLines = message.split('\n').slice(0, 3);
-      return splitMessageByLines(message, OPEN_TASK_REPORT_MAX_MESSAGE_CHARS, headerLines);
-    });
+  const messages = buildOpenTaskWatchMessages(alerts, failed);
 
   for (const chunk of messages) {
     await coworkRequest('POST', `/chats/${ELAPSED_NOTIFICATION_CHAT_ID}/messages`, { message: chunk });
