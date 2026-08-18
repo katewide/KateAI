@@ -3437,7 +3437,22 @@ async function analyzeOpenTaskWatchTask(taskId, candidateInfo) {
   return result;
 }
 
-function buildOpenTaskWatchMessage(alerts, failed = []) {
+function formatOpenTaskReportDate(now = new Date()) {
+  const parts = new Intl.DateTimeFormat('ru-RU', {
+    timeZone: 'Europe/Moscow',
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+  }).formatToParts(now);
+  const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return `${values.day} ${values.month} ${values.year}`;
+}
+
+function getOpenTaskReportTitle(now = new Date()) {
+  return `📈 [b]Контроль открытых задач ${formatOpenTaskReportDate(now)}[/b]`;
+}
+
+function buildOpenTaskWatchMessages(alerts, failed = []) {
   const statusOrder = [
     '🔴 Требует решения по актуальности',
     '🟠 Ждет ответа от ЭЛРОС',
@@ -3453,43 +3468,53 @@ function buildOpenTaskWatchMessage(alerts, failed = []) {
     if (groupDiff !== 0) return groupDiff;
     return String(a.task_id || '').localeCompare(String(b.task_id || ''), 'ru', { numeric: true });
   });
+  const messages = [];
 
-  const lines = ['📈 [b]Контроль открытых задач[/b]'];
-  let currentStatus = null;
+  for (const status of statusOrder) {
+    const statusAlerts = sortedAlerts.filter(alert => alert.alert_status === status);
+    if (statusAlerts.length === 0) continue;
 
-  for (const alert of sortedAlerts) {
-    const statusMatch = String(alert.alert_status || '').match(/^(\S+)/);
+    const statusMatch = String(status || '').match(/^(\S+)/);
     const statusIcon = statusMatch ? statusMatch[1] : '';
-    const statusText = String(alert.alert_status || '').replace(/^\S+\s*/, '').trim();
-    const taskTitle = alert.task_title || alert.title || 'Без названия';
-    const groupName = alert.group_name || `Группа ${alert.group_id || 'без названия'}`;
-    const responsibleName = alert.responsible_name || UNKNOWN_USER_NAME;
-    const nextCheckDate = alert.next_recheck_at ? formatShortDateForMessage(alert.next_recheck_at) : 'не указана';
+    const statusText = String(status || '').replace(/^\S+\s*/, '').trim();
+    const lines = [
+      getOpenTaskReportTitle(),
+      '',
+      `${statusIcon} [i][b]${statusText || status}[/b][/i]`,
+    ];
 
-    if (alert.alert_status !== currentStatus) {
-      currentStatus = alert.alert_status;
-      lines.push('', `${statusIcon} [i][b]${statusText || currentStatus}[/b][/i]`);
+    for (const alert of statusAlerts) {
+      const taskTitle = alert.task_title || alert.title || 'Без названия';
+      const groupName = alert.group_name || `Группа ${alert.group_id || 'без названия'}`;
+      const responsibleName = alert.responsible_name || UNKNOWN_USER_NAME;
+      const nextCheckDate = alert.next_recheck_at ? formatShortDateForMessage(alert.next_recheck_at) : 'не указана';
+
+      lines.push(
+        '',
+        `${statusIcon} [URL=${alert.task_link}]${alert.task_id}[/URL] [b]${taskTitle}[/b]`,
+        `🏢 ${groupName} | 👤 ${responsibleName} | 📅 ${nextCheckDate}`,
+        `[i]${alert.summary}[/i]`
+      );
     }
 
-    lines.push(
-      '',
-      `${statusIcon} [URL=${alert.task_link}]${alert.task_id}[/URL] [b]${taskTitle}[/b]`,
-      `🏢 ${groupName} | 👤 ${responsibleName} | 📅 ${nextCheckDate}`,
-      `[i]${alert.summary}[/i]`
-    );
+    messages.push(lines.join('\n').trim());
   }
 
-  return lines.join('\n').trim();
+  return messages;
 }
 
-function splitMessageByLines(message, maxChars) {
+function splitMessageByLines(message, maxChars, repeatedHeaderLines = []) {
   const normalizedMaxChars = Number.isFinite(maxChars) && maxChars > 1000 ? maxChars : 7000;
   if (message.length <= normalizedMaxChars) return [message];
 
   const chunks = [];
   let current = '';
+  const header = repeatedHeaderLines.filter(Boolean).join('\n').trim();
+  const bodyLines = header && message.startsWith(header)
+    ? message.slice(header.length).replace(/^\n+/, '').split('\n')
+    : message.split('\n');
 
-  for (const line of message.split('\n')) {
+  for (const line of bodyLines) {
     const next = current ? `${current}\n${line}` : line;
     if (next.length > normalizedMaxChars && current) {
       chunks.push(current.trim());
@@ -3500,19 +3525,19 @@ function splitMessageByLines(message, maxChars) {
   }
 
   if (current.trim()) chunks.push(current.trim());
-  if (chunks.length <= 1) return chunks;
+  if (!header) return chunks;
 
-  return chunks.map((chunk, index) => {
-    const title = `📈 Контроль открытых задач, часть ${index + 1}/${chunks.length}:`;
-    return chunk.replace(/^📈 Контроль открытых задач:/, title);
-  });
+  return chunks.map(chunk => `${header}\n${chunk}`.trim());
 }
 
 async function sendOpenTaskWatchReport(alerts, failed = []) {
   if (alerts.length === 0 && failed.length === 0) return null;
 
-  const message = buildOpenTaskWatchMessage(alerts, failed);
-  const messages = splitMessageByLines(message, OPEN_TASK_REPORT_MAX_MESSAGE_CHARS);
+  const messages = buildOpenTaskWatchMessages(alerts, failed)
+    .flatMap(message => {
+      const headerLines = message.split('\n').slice(0, 3);
+      return splitMessageByLines(message, OPEN_TASK_REPORT_MAX_MESSAGE_CHARS, headerLines);
+    });
 
   for (const chunk of messages) {
     await coworkRequest('POST', `/chats/${ELAPSED_NOTIFICATION_CHAT_ID}/messages`, { message: chunk });
