@@ -3071,6 +3071,23 @@ async function processClosedTask(taskId, options = {}) {
           message: insufficientInfoComment,
         });
       }
+      const summaryFieldValue = '';
+      let summaryFieldUpdated = false;
+      let summaryFieldCode = TASK_SUMMARY_FIELD_CODE;
+      let summaryFieldError = null;
+      let summaryFieldCleared = false;
+      let summaryFieldSkipped = false;
+      let summaryFieldSkipReason = null;
+
+      if (!dryRun) {
+        const summaryFieldResult = await updateTaskSummaryField(taskId, summaryFieldValue, mainTask);
+        summaryFieldCode = summaryFieldResult.field;
+        summaryFieldUpdated = summaryFieldResult.updated;
+        summaryFieldError = summaryFieldResult.error;
+        summaryFieldSkipped = Boolean(summaryFieldResult.skipped);
+        summaryFieldSkipReason = summaryFieldResult.reason || null;
+        summaryFieldCleared = summaryFieldUpdated;
+      }
 
       return {
         ok: true,
@@ -3090,15 +3107,15 @@ async function processClosedTask(taskId, options = {}) {
         parent_image_facts_found: Boolean(parentImageFacts),
         comment_posted: !dryRun,
         comment_would_be_posted: dryRun,
-        summary_field: TASK_SUMMARY_FIELD_CODE,
-        summary_field_value: '',
-        summary_field_updated: false,
-        summary_field_would_be_updated: false,
-        summary_field_skipped: true,
-        summary_field_skip_reason: 'no_title',
-        summary_field_cleared: false,
-        summary_field_would_be_cleared: false,
-        summary_field_error: null,
+        summary_field: summaryFieldCode,
+        summary_field_value: summaryFieldValue,
+        summary_field_updated: summaryFieldUpdated,
+        summary_field_would_be_updated: dryRun,
+        summary_field_skipped: summaryFieldSkipped,
+        summary_field_skip_reason: summaryFieldSkipReason,
+        summary_field_cleared: summaryFieldCleared,
+        summary_field_would_be_cleared: dryRun,
+        summary_field_error: summaryFieldError,
         generated_title: null,
         raw_ai_comment: aiComment,
         ai_comment: insufficientInfoComment,
@@ -3142,16 +3159,17 @@ async function processClosedTask(taskId, options = {}) {
   let summaryFieldSkipped = false;
   let summaryFieldSkipReason = null;
 
-  if (!generatedTitle) {
+  if (isSummaryOnlyGroup(groupId)) {
     summaryFieldSkipped = true;
-    summaryFieldSkipReason = 'no_title';
-  } else if (!isSummaryOnlyGroup(groupId) && !dryRun) {
+    summaryFieldSkipReason = 'summary_only_group';
+  } else if (!dryRun) {
     const summaryFieldResult = await updateTaskSummaryField(taskId, summaryFieldValue, mainTask);
     summaryFieldCode = summaryFieldResult.field;
     summaryFieldUpdated = summaryFieldResult.updated;
     summaryFieldError = summaryFieldResult.error;
     summaryFieldSkipped = Boolean(summaryFieldResult.skipped);
     summaryFieldSkipReason = summaryFieldResult.reason || null;
+    summaryFieldCleared = !generatedTitle && summaryFieldUpdated;
   }
 
   return {
@@ -3175,11 +3193,11 @@ async function processClosedTask(taskId, options = {}) {
     summary_field: summaryFieldCode,
     summary_field_value: summaryFieldValue,
     summary_field_updated: summaryFieldUpdated,
-    summary_field_would_be_updated: Boolean(generatedTitle && !isSummaryOnlyGroup(groupId) && dryRun),
+    summary_field_would_be_updated: Boolean(!isSummaryOnlyGroup(groupId) && dryRun),
     summary_field_skipped: summaryFieldSkipped,
     summary_field_skip_reason: summaryFieldSkipReason,
     summary_field_cleared: summaryFieldCleared,
-    summary_field_would_be_cleared: false,
+    summary_field_would_be_cleared: Boolean(!generatedTitle && !isSummaryOnlyGroup(groupId) && dryRun),
     summary_field_error: summaryFieldError,
     generated_title: generatedTitle,
     raw_ai_comment: aiComment,
