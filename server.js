@@ -1533,6 +1533,18 @@ function getLookbackDate(days) {
   return date.toISOString();
 }
 
+function formatMskApiDateTime(date) {
+  const mskDate = new Date(date.getTime() + MSK_UTC_OFFSET_HOURS * 60 * 60 * 1000);
+  const year = mskDate.getUTCFullYear();
+  const month = String(mskDate.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(mskDate.getUTCDate()).padStart(2, '0');
+  const hours = String(mskDate.getUTCHours()).padStart(2, '0');
+  const minutes = String(mskDate.getUTCMinutes()).padStart(2, '0');
+  const seconds = String(mskDate.getUTCSeconds()).padStart(2, '0');
+
+  return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}+03:00`;
+}
+
 function buildTaskTimeSearchWindows() {
   const windows = [];
   const lookbackStart = new Date(getLookbackDate(TASK_TIME_LOOKBACK_DAYS));
@@ -1544,8 +1556,10 @@ function buildTaskTimeSearchWindows() {
     if (windowFrom < lookbackStart) windowFrom.setTime(lookbackStart.getTime());
 
     windows.push({
-      from: windowFrom.toISOString(),
-      to: windowTo.toISOString(),
+      from: formatMskApiDateTime(windowFrom),
+      to: formatMskApiDateTime(windowTo),
+      fromUtc: windowFrom.toISOString(),
+      toUtc: windowTo.toISOString(),
     });
 
     windowTo = windowFrom;
@@ -1819,15 +1833,26 @@ async function rememberClosedTaskTime(taskId) {
     return { ok: true, skipped: true, reason: 'task_not_closed', task_id: taskId };
   }
 
-  const timeLogs = await fetchTaskTimeLogs(taskId);
   await saveTaskTimeState(task);
-  await saveTaskTimeEntryStates(taskId, timeLogs);
+
+  let timeLogs = [];
+  let timeEntryError = null;
+  try {
+    timeLogs = await fetchTaskTimeLogs(taskId);
+    await saveTaskTimeEntryStates(taskId, timeLogs);
+  } catch (error) {
+    timeEntryError = error.message;
+    log('Closed task time entries save failed', { task_id: taskId, error: error.message });
+  }
+
   return {
     ok: true,
     task_id: String(taskId),
     time_spent_in_logs: getTaskTimeSpent(task),
     duration_fact: getTaskDurationFact(task),
     time_entries: timeLogs.length,
+    time_entries_saved: !timeEntryError,
+    time_entries_error: timeEntryError,
   };
 }
 
