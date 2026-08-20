@@ -2477,10 +2477,21 @@ function extractTitleFromAiComment(comment) {
     .trim() || null;
 }
 
-async function updateTaskSummaryField(taskId, value) {
+function getTaskSummaryFieldValue(task) {
+  const value = task?.[TASK_SUMMARY_FIELD_CODE];
+  return value == null ? '' : String(value);
+}
+
+async function updateTaskSummaryField(taskId, value, currentTask = null) {
+  const normalizedValue = value == null ? '' : String(value);
+  const currentValue = currentTask ? getTaskSummaryFieldValue(currentTask) : null;
+  if (currentValue !== null && currentValue === normalizedValue) {
+    return { updated: false, skipped: true, reason: 'same_value', field: TASK_SUMMARY_FIELD_CODE, error: null };
+  }
+
   try {
     await coworkRequest('PATCH', `/tasks/${taskId}`, {
-      [TASK_SUMMARY_FIELD_CODE]: value,
+      [TASK_SUMMARY_FIELD_CODE]: normalizedValue,
     });
     return { updated: true, field: TASK_SUMMARY_FIELD_CODE, error: null };
   } catch (error) {
@@ -3055,19 +3066,10 @@ async function processClosedTask(taskId, options = {}) {
   if (isInsufficientInfoComment(aiComment)) {
     if (timeSpentInLogs > 0) {
       const insufficientInfoComment = buildInsufficientInfoComment(responsibleId);
-      const summaryFieldValue = getTaskTitle(mainTask) || '';
       if (!dryRun) {
         await coworkRequest('POST', `/tasks/${taskId}/comments`, {
           message: insufficientInfoComment,
         });
-      }
-      let summaryFieldUpdated = false;
-      let summaryFieldError = null;
-
-      if (!dryRun) {
-        const summaryFieldResult = await updateTaskSummaryField(taskId, summaryFieldValue);
-        summaryFieldUpdated = summaryFieldResult.updated;
-        summaryFieldError = summaryFieldResult.error;
       }
 
       return {
@@ -3089,13 +3091,15 @@ async function processClosedTask(taskId, options = {}) {
         comment_posted: !dryRun,
         comment_would_be_posted: dryRun,
         summary_field: TASK_SUMMARY_FIELD_CODE,
-        summary_field_value: summaryFieldValue,
-        summary_field_updated: summaryFieldUpdated,
-        summary_field_would_be_updated: dryRun,
+        summary_field_value: '',
+        summary_field_updated: false,
+        summary_field_would_be_updated: false,
+        summary_field_skipped: true,
+        summary_field_skip_reason: 'no_title',
         summary_field_cleared: false,
         summary_field_would_be_cleared: false,
-        summary_field_error: summaryFieldError,
-        generated_title: summaryFieldValue || null,
+        summary_field_error: null,
+        generated_title: null,
         raw_ai_comment: aiComment,
         ai_comment: insufficientInfoComment,
       };
@@ -3135,13 +3139,19 @@ async function processClosedTask(taskId, options = {}) {
   let summaryFieldCode = TASK_SUMMARY_FIELD_CODE;
   let summaryFieldError = null;
   let summaryFieldCleared = false;
+  let summaryFieldSkipped = false;
+  let summaryFieldSkipReason = null;
 
-  if (!isSummaryOnlyGroup(groupId) && !dryRun) {
-    const summaryFieldResult = await updateTaskSummaryField(taskId, summaryFieldValue);
+  if (!generatedTitle) {
+    summaryFieldSkipped = true;
+    summaryFieldSkipReason = 'no_title';
+  } else if (!isSummaryOnlyGroup(groupId) && !dryRun) {
+    const summaryFieldResult = await updateTaskSummaryField(taskId, summaryFieldValue, mainTask);
     summaryFieldCode = summaryFieldResult.field;
     summaryFieldUpdated = summaryFieldResult.updated;
     summaryFieldError = summaryFieldResult.error;
-    summaryFieldCleared = !generatedTitle && summaryFieldUpdated;
+    summaryFieldSkipped = Boolean(summaryFieldResult.skipped);
+    summaryFieldSkipReason = summaryFieldResult.reason || null;
   }
 
   return {
@@ -3165,9 +3175,11 @@ async function processClosedTask(taskId, options = {}) {
     summary_field: summaryFieldCode,
     summary_field_value: summaryFieldValue,
     summary_field_updated: summaryFieldUpdated,
-    summary_field_would_be_updated: Boolean(!isSummaryOnlyGroup(groupId) && dryRun),
+    summary_field_would_be_updated: Boolean(generatedTitle && !isSummaryOnlyGroup(groupId) && dryRun),
+    summary_field_skipped: summaryFieldSkipped,
+    summary_field_skip_reason: summaryFieldSkipReason,
     summary_field_cleared: summaryFieldCleared,
-    summary_field_would_be_cleared: Boolean(!generatedTitle && !isSummaryOnlyGroup(groupId) && dryRun),
+    summary_field_would_be_cleared: false,
     summary_field_error: summaryFieldError,
     generated_title: generatedTitle,
     raw_ai_comment: aiComment,
