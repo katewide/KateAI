@@ -118,6 +118,22 @@ db.serialize(() => {
     sent_at TEXT NOT NULL
   )`);
 
+  db.run(`CREATE TABLE IF NOT EXISTS task_time_entry_state (
+    task_id TEXT NOT NULL,
+    entry_id TEXT NOT NULL,
+    user_id TEXT,
+    seconds INTEGER NOT NULL DEFAULT 0,
+    minutes INTEGER NOT NULL DEFAULT 0,
+    comment_text TEXT,
+    created_date TEXT,
+    date_start TEXT,
+    date_stop TEXT,
+    entry_json TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, entry_id)
+  )`);
+
 });
 
 openTaskDb.serialize(() => {
@@ -1671,6 +1687,138 @@ async function saveTaskTimeState(task) {
   ]);
 }
 
+function getTimeEntryId(entry) {
+  const entryId = entry?.id ?? entry?.ID;
+  return entryId == null || entryId === '' ? null : String(entryId);
+}
+
+function getTimeEntryUserId(entry) {
+  const userId = entry?.userId ?? entry?.USER_ID ?? entry?.user?.id ?? entry?.USER?.ID;
+  return userId == null || userId === '' ? null : String(userId).replace(/^user_/i, '');
+}
+
+function getTimeEntrySeconds(entry) {
+  const seconds = Number.parseInt(entry?.seconds ?? entry?.SECONDS ?? 0, 10);
+  if (Number.isFinite(seconds)) return seconds;
+
+  const minutes = Number.parseInt(entry?.minutes ?? entry?.MINUTES ?? 0, 10);
+  return Number.isFinite(minutes) ? minutes * 60 : 0;
+}
+
+function getTimeEntryMinutes(entry) {
+  const minutes = Number.parseInt(entry?.minutes ?? entry?.MINUTES, 10);
+  return Number.isFinite(minutes) ? minutes : Math.round(getTimeEntrySeconds(entry) / 60);
+}
+
+function getTimeEntryComment(entry) {
+  return entry?.commentText ?? entry?.COMMENT_TEXT ?? entry?.comment ?? entry?.COMMENT ?? null;
+}
+
+function getTimeEntryCreatedDate(entry) {
+  return entry?.createdDate ?? entry?.CREATED_DATE ?? null;
+}
+
+function getTimeEntryDateStart(entry) {
+  return entry?.dateStart ?? entry?.DATE_START ?? null;
+}
+
+function getTimeEntryDateStop(entry) {
+  return entry?.dateStop ?? entry?.DATE_STOP ?? null;
+}
+
+function normalizeTimeEntryForState(entry) {
+  const entryId = getTimeEntryId(entry);
+  if (!entryId) return null;
+
+  return {
+    entryId,
+    userId: getTimeEntryUserId(entry),
+    seconds: getTimeEntrySeconds(entry),
+    minutes: getTimeEntryMinutes(entry),
+    commentText: getTimeEntryComment(entry),
+    createdDate: getTimeEntryCreatedDate(entry),
+    dateStart: getTimeEntryDateStart(entry),
+    dateStop: getTimeEntryDateStop(entry),
+    raw: entry,
+  };
+}
+
+async function getTaskTimeEntryStates(taskId) {
+  return queryDb(
+    'SELECT * FROM task_time_entry_state WHERE task_id = ?',
+    [String(taskId)]
+  );
+}
+
+async function getTaskTimeEntryStateCount(taskId) {
+  const rows = await queryDb(
+    'SELECT COUNT(*) AS count FROM task_time_entry_state WHERE task_id = ?',
+    [String(taskId)]
+  );
+  return Number(rows[0]?.count || 0);
+}
+
+async function saveTaskTimeEntryStates(taskId, entries) {
+  const normalizedTaskId = String(taskId);
+  const now = new Date().toISOString();
+  const normalizedEntries = entries
+    .map(normalizeTimeEntryForState)
+    .filter(Boolean);
+  const currentEntryIds = normalizedEntries.map(entry => entry.entryId);
+
+  for (const entry of normalizedEntries) {
+    await runDb(`
+      INSERT INTO task_time_entry_state (
+        task_id,
+        entry_id,
+        user_id,
+        seconds,
+        minutes,
+        comment_text,
+        created_date,
+        date_start,
+        date_stop,
+        entry_json,
+        first_seen_at,
+        last_seen_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(task_id, entry_id) DO UPDATE SET
+        user_id = excluded.user_id,
+        seconds = excluded.seconds,
+        minutes = excluded.minutes,
+        comment_text = excluded.comment_text,
+        created_date = excluded.created_date,
+        date_start = excluded.date_start,
+        date_stop = excluded.date_stop,
+        entry_json = excluded.entry_json,
+        last_seen_at = excluded.last_seen_at
+    `, [
+      normalizedTaskId,
+      entry.entryId,
+      entry.userId,
+      entry.seconds,
+      entry.minutes,
+      entry.commentText,
+      entry.createdDate,
+      entry.dateStart,
+      entry.dateStop,
+      JSON.stringify(entry.raw),
+      now,
+      now,
+    ]);
+  }
+
+  if (currentEntryIds.length > 0) {
+    const placeholders = currentEntryIds.map(() => '?').join(',');
+    await runDb(
+      `DELETE FROM task_time_entry_state WHERE task_id = ? AND entry_id NOT IN (${placeholders})`,
+      [normalizedTaskId, ...currentEntryIds]
+    );
+  } else {
+    await runDb('DELETE FROM task_time_entry_state WHERE task_id = ?', [normalizedTaskId]);
+  }
+}
+
 async function rememberClosedTaskTime(taskId) {
   const taskResponse = await coworkRequest('GET', `/tasks/${taskId}`);
   const task = normalizeTaskPayload(taskResponse);
@@ -1679,12 +1827,15 @@ async function rememberClosedTaskTime(taskId) {
     return { ok: true, skipped: true, reason: 'task_not_closed', task_id: taskId };
   }
 
+  const timeLogs = await fetchTaskTimeLogs(taskId);
   await saveTaskTimeState(task);
+  await saveTaskTimeEntryStates(taskId, timeLogs);
   return {
     ok: true,
     task_id: String(taskId),
     time_spent_in_logs: getTaskTimeSpent(task),
     duration_fact: getTaskDurationFact(task),
+    time_entries: timeLogs.length,
   };
 }
 
@@ -1789,6 +1940,93 @@ async function getTimeHistoryChangesForTask(task, previousState, fallbackChange)
   }];
 }
 
+function buildTimeEntryChange({ task, taskId, taskLink, entryId, userId, userName, previousEntry, currentEntry }) {
+  const oldSeconds = Number(previousEntry?.seconds || 0);
+  const newSeconds = Number(currentEntry?.seconds || 0);
+
+  return {
+    task,
+    taskId,
+    taskLink,
+    title: getTaskTitle(task),
+    groupId: getGroupIdFromTask(task),
+    userId,
+    userName: userName || (userId ? `Пользователь ${userId}` : UNKNOWN_USER_NAME),
+    timeEntryId: entryId,
+    oldTimeSpent: oldSeconds,
+    newTimeSpent: newSeconds,
+    oldDurationFact: Math.round(oldSeconds / 60),
+    newDurationFact: Math.round(newSeconds / 60),
+    diffMinutes: Math.round((newSeconds - oldSeconds) / 60),
+    time_entry_created_date: currentEntry?.createdDate || previousEntry?.created_date || null,
+    time_entry_date_start: currentEntry?.dateStart || previousEntry?.date_start || null,
+    time_entry_comment: currentEntry?.commentText ?? previousEntry?.comment_text ?? null,
+  };
+}
+
+async function getTimeEntryChangesForTask(task, previousState, fallbackChange) {
+  const taskId = String(task?.id || task?.ID);
+  const taskLink = buildTaskLink(task);
+  const previousRows = await getTaskTimeEntryStates(taskId);
+  const currentLogs = await fetchTaskTimeLogs(taskId);
+  const currentEntries = currentLogs
+    .map(normalizeTimeEntryForState)
+    .filter(Boolean);
+
+  if (previousRows.length === 0) {
+    return {
+      changes: [{
+        ...fallbackChange,
+        userId: null,
+        userName: UNKNOWN_USER_NAME,
+        timeEntryId: null,
+        time_entry_created_date: null,
+        time_entry_date_start: null,
+        time_entry_comment: null,
+        detail_source: 'aggregate_no_time_entry_baseline',
+      }],
+      currentLogs,
+      usedFallback: true,
+    };
+  }
+
+  const previousById = new Map(previousRows.map(row => [String(row.entry_id), row]));
+  const currentById = new Map(currentEntries.map(entry => [entry.entryId, entry]));
+  const entryIds = [...new Set([...previousById.keys(), ...currentById.keys()])].sort((a, b) =>
+    String(a).localeCompare(String(b), 'ru', { numeric: true })
+  );
+  const changes = [];
+
+  for (const entryId of entryIds) {
+    const previousEntry = previousById.get(entryId) || null;
+    const currentEntry = currentById.get(entryId) || null;
+    const oldSeconds = Number(previousEntry?.seconds || 0);
+    const newSeconds = Number(currentEntry?.seconds || 0);
+    if (oldSeconds === newSeconds) continue;
+
+    const userId = currentEntry?.userId || previousEntry?.user_id || null;
+    const userName = await getUserNameById(userId);
+    const change = buildTimeEntryChange({
+      task,
+      taskId,
+      taskLink,
+      entryId,
+      userId,
+      userName,
+      previousEntry,
+      currentEntry,
+    });
+
+    if (change.diffMinutes !== 0) changes.push(change);
+  }
+
+  return {
+    changes,
+    currentLogs,
+    usedFallback: false,
+  };
+}
+
 function saveTimeChatDecision(changes, message) {
   const taskIds = [...new Set(changes.map(change => change.taskId))];
   const users = [...new Map(changes.map(change => [
@@ -1815,9 +2053,10 @@ function buildTimeChangesMessage(changes) {
 
   for (const change of changes) {
     const userName = change.userName || UNKNOWN_USER_NAME;
+    const entryLabel = change.timeEntryId ? ` | 🔑 ${change.timeEntryId}` : '';
     lines.push(
       '',
-      `${getChangeIcon(change.diffMinutes)} Задача [URL=${change.taskLink}]${change.taskId}[/URL] ${getChangeVerb(change.diffMinutes)} на ${formatHours(change.diffMinutes)} ч. | 👤 ${userName}`
+      `${getChangeIcon(change.diffMinutes)} Задача [URL=${change.taskLink}]${change.taskId}[/URL] ${getChangeVerb(change.diffMinutes)} на ${formatHours(change.diffMinutes)} ч. | 👤 ${userName}${entryLabel}`
     );
   }
 
@@ -1852,12 +2091,106 @@ async function cleanupOldTimeAlerts() {
 async function cleanupOldTaskTimeState() {
   const cutoffDate = getLookbackDate(TASK_TIME_LOOKBACK_DAYS);
 
+  await runDb(
+    `DELETE FROM task_time_entry_state
+     WHERE task_id IN (
+       SELECT task_id FROM task_time_state
+       WHERE closed_date IS NOT NULL AND closed_date < ?
+     )`,
+    [cutoffDate]
+  );
+
   const result = await runDb(
     'DELETE FROM task_time_state WHERE closed_date IS NOT NULL AND closed_date < ?',
     [cutoffDate]
   );
 
   return result.changes || 0;
+}
+
+async function runTaskTimeEntryBaseline(options = {}) {
+  if (taskTimeCheckInProgress) {
+    const result = {
+      ok: true,
+      skipped: true,
+      reason: 'task_time_check_already_running',
+      started_at: taskTimeCheckStartedAt,
+      stage: taskTimeCheckStage,
+    };
+    saveDebug('lastTaskTimeCheck', result);
+    return result;
+  }
+
+  const limit = Number.parseInt(options.limit, 10);
+  const maxToProcess = Number.isInteger(limit) && limit > 0 ? limit : 100;
+  const force = Boolean(options.force);
+  taskTimeCheckInProgress = true;
+  taskTimeCheckStartedAt = new Date().toISOString();
+  taskTimeCheckStage = 'time_entry_baseline';
+
+  try {
+    const tasks = await fetchClosedTasksForTimeCheck();
+    const processed = [];
+    const failed = [];
+    let skippedExisting = 0;
+    let skippedAfterLimit = 0;
+
+    for (const task of tasks) {
+      const taskId = String(task?.id || task?.ID || '');
+      if (!taskId) continue;
+
+      if (processed.length >= maxToProcess) {
+        skippedAfterLimit += 1;
+        continue;
+      }
+
+      try {
+        const existingEntries = await getTaskTimeEntryStateCount(taskId);
+        if (existingEntries > 0 && !force) {
+          skippedExisting += 1;
+          continue;
+        }
+
+        const timeLogs = await fetchTaskTimeLogs(taskId);
+        await saveTaskTimeState(task);
+        await saveTaskTimeEntryStates(taskId, timeLogs);
+        processed.push({
+          task_id: taskId,
+          time_entries: timeLogs.length,
+          time_spent_in_logs: getTaskTimeSpent(task),
+        });
+      } catch (error) {
+        failed.push({
+          task_id: taskId,
+          error: error.message,
+        });
+      }
+    }
+
+    const result = {
+      ok: true,
+      limit: maxToProcess,
+      force,
+      closed_tasks_found: tasks.length,
+      processed_tasks: processed.length,
+      skipped_existing: skippedExisting,
+      skipped_after_limit: skippedAfterLimit,
+      failed_tasks: failed.length,
+      processed,
+      failed,
+    };
+
+    saveDebug('lastTaskTimeCheck', {
+      status: 'time_entry_baseline_completed',
+      ...result,
+    });
+
+    return result;
+  } finally {
+    taskTimeCheckInProgress = false;
+    taskTimeCheckStartedAt = null;
+    taskTimeCheckStage = null;
+  }
 }
 
 async function runTaskTimeCheck() {
@@ -1890,6 +2223,7 @@ async function runTaskTimeCheck() {
     let initialized = 0;
     let unchanged = 0;
     let historyChecked = 0;
+    const changedTasksToSave = new Map();
 
     taskTimeCheckStage = 'compare_with_sqlite';
 
@@ -1903,7 +2237,9 @@ async function runTaskTimeCheck() {
 
       if (!previousState) {
         initialized += 1;
+        const timeLogs = await fetchTaskTimeLogs(taskId);
         await saveTaskTimeState(task);
+        await saveTaskTimeEntryStates(taskId, timeLogs);
         continue;
       }
 
@@ -1930,8 +2266,10 @@ async function runTaskTimeCheck() {
       };
 
       historyChecked += 1;
-      const historyChanges = await getTimeHistoryChangesForTask(task, previousState, fallbackChange);
-      changes.push(...historyChanges);
+      const entryComparison = await getTimeEntryChangesForTask(task, previousState, fallbackChange);
+      changes.push(...entryComparison.changes);
+      await saveTaskTimeEntryStates(taskId, entryComparison.currentLogs);
+      changedTasksToSave.set(taskId, task);
     }
 
     taskTimeCheckStage = 'send_chat_report';
@@ -1939,8 +2277,8 @@ async function runTaskTimeCheck() {
     saveTimeChatDecision(changes, message);
 
     taskTimeCheckStage = 'save_changed_tasks';
-    for (const change of changes) {
-      await saveTaskTimeState(change.task);
+    for (const task of changedTasksToSave.values()) {
+      await saveTaskTimeState(task);
     }
 
     taskTimeCheckStage = 'cleanup_old_alerts';
@@ -1960,6 +2298,7 @@ async function runTaskTimeCheck() {
       unchanged_tasks: unchanged,
       changed_tasks: uniqueChangedTasks,
       changed_time_events: changes.length,
+      time_entries_checked_tasks: historyChecked,
       history_checked_tasks: historyChecked,
       deleted_old_alerts: deletedOldAlerts,
       deleted_old_task_time_state: deletedOldState,
@@ -4213,6 +4552,18 @@ const server = http.createServer(async (req, res) => {
     if ((req.method === 'GET' || req.method === 'POST') && pathname === '/time-check') {
       if (req.method === 'POST') await readBody(req);
       const result = await runTaskTimeCheck();
+      sendJson(res, 200, result);
+      return;
+    }
+
+    if ((req.method === 'GET' || req.method === 'POST') && pathname === '/time-entry-baseline') {
+      if (req.method === 'POST') await readBody(req);
+      const searchParams = new URL(req.url, `http://${req.headers.host || 'localhost'}`).searchParams;
+      const limit = Number.parseInt(searchParams.get('limit'), 10);
+      const force = searchParams.get('force') === 'true';
+      const options = { force };
+      if (Number.isInteger(limit) && limit > 0) options.limit = limit;
+      const result = await runTaskTimeEntryBaseline(options);
       sendJson(res, 200, result);
       return;
     }
