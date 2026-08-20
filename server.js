@@ -2478,6 +2478,30 @@ function extractTitleFromAiComment(comment) {
 }
 
 function getTaskSummaryFieldValue(task) {
+  const candidates = [
+    task,
+    task?.fields,
+    task?.FIELDS,
+    task?.customFields,
+    task?.CUSTOM_FIELDS,
+    task?.ufFields,
+    task?.UF_FIELDS,
+    task?.userFields,
+    task?.USER_FIELDS,
+  ];
+
+  for (const source of candidates) {
+    if (!source || typeof source !== 'object') continue;
+    if (Object.prototype.hasOwnProperty.call(source, TASK_SUMMARY_FIELD_CODE)) {
+      const value = source[TASK_SUMMARY_FIELD_CODE];
+      return value == null ? '' : String(value);
+    }
+    if (Object.prototype.hasOwnProperty.call(source, 'ufTaskTitle')) {
+      const value = source.ufTaskTitle;
+      return value == null ? '' : String(value);
+    }
+  }
+
   const value = task?.[TASK_SUMMARY_FIELD_CODE];
   return value == null ? '' : String(value);
 }
