@@ -2383,20 +2383,28 @@ function isDoneStageChange(change) {
   return normalizeHistoryField(change?.field) === 'STAGE' && String(change?.value?.to || '').trim() === 'Сделаны';
 }
 
+function isTagsChange(change) {
+  return normalizeHistoryField(change?.field) === 'TAGS';
+}
+
 function isStatusClosedChange(change) {
   return normalizeHistoryField(change?.field) === 'STATUS' && String(change?.value?.to) === '5';
 }
 
-function findClosedStatusChangeNearDoneStage(history, doneStageChange) {
-  if (!doneStageChange || !Number.isFinite(doneStageChange.createdAtMs)) return null;
+function findClosedStatusChangeNearAnchor(history, anchorChange) {
+  if (!anchorChange || !Number.isFinite(anchorChange.createdAtMs)) return null;
 
-  const stageTimeMs = doneStageChange.createdAtMs;
+  const anchorTimeMs = anchorChange.createdAtMs;
   return history.find(change =>
     isStatusClosedChange(change) &&
     Number.isFinite(change.createdAtMs) &&
-    change.createdAtMs >= stageTimeMs - 1000 &&
-    change.createdAtMs <= stageTimeMs
+    change.createdAtMs >= anchorTimeMs - 1000 &&
+    change.createdAtMs <= anchorTimeMs
   ) || null;
+}
+
+function findClosedStatusChangeNearDoneStage(history, doneStageChange) {
+  return findClosedStatusChangeNearAnchor(history, doneStageChange);
 }
 
 function findResponsibleChangeNearStage(updateBatch, stageChange) {
@@ -4171,6 +4179,7 @@ async function handleWebhook(body) {
   const primaryChange = updateBatch[0] || null;
   const primaryField = normalizeHistoryField(primaryChange?.field);
   const stageChange = primaryField === normalizeHistoryField('STAGE') ? primaryChange : null;
+  const tagChange = isTagsChange(primaryChange) ? primaryChange : null;
   const doneStageChange = isDoneStageChange(primaryChange) ? primaryChange : null;
   const responsibleChange = primaryField === normalizeHistoryField('RESPONSIBLE_ID')
     ? primaryChange
@@ -4190,11 +4199,18 @@ async function handleWebhook(body) {
   let shouldProcessClosedTask = String(statusChange?.value?.to) === '5';
   let closeTrigger = shouldProcessClosedTask ? 'status_to_5' : null;
   let statusChangeNearDoneStage = null;
+  let statusChangeNearTag = null;
 
   if (!shouldProcessClosedTask && doneStageChange) {
     statusChangeNearDoneStage = findClosedStatusChangeNearDoneStage(updateContext.history, doneStageChange);
     shouldProcessClosedTask = Boolean(statusChangeNearDoneStage);
     closeTrigger = shouldProcessClosedTask ? 'done_stage_with_recent_status_to_5' : null;
+  }
+
+  if (!shouldProcessClosedTask && tagChange) {
+    statusChangeNearTag = findClosedStatusChangeNearAnchor(updateContext.history, tagChange);
+    shouldProcessClosedTask = Boolean(statusChangeNearTag);
+    closeTrigger = shouldProcessClosedTask ? 'tag_with_recent_status_to_5' : null;
   }
 
   saveDebug('lastTaskCloseDecision', {
@@ -4207,6 +4223,9 @@ async function handleWebhook(body) {
     done_stage_change: Boolean(doneStageChange),
     status_change_near_done_stage_id: statusChangeNearDoneStage?.id || null,
     status_change_near_done_stage_at: statusChangeNearDoneStage?.createdDate || null,
+    tag_change: Boolean(tagChange),
+    status_change_near_tag_id: statusChangeNearTag?.id || null,
+    status_change_near_tag_at: statusChangeNearTag?.createdDate || null,
     should_process_closed_task: shouldProcessClosedTask,
     close_trigger: closeTrigger,
   });
