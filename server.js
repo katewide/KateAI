@@ -1750,14 +1750,6 @@ async function getTaskTimeEntryStates(taskId) {
   );
 }
 
-async function getTaskTimeEntryStateCount(taskId) {
-  const rows = await queryDb(
-    'SELECT COUNT(*) AS count FROM task_time_entry_state WHERE task_id = ?',
-    [String(taskId)]
-  );
-  return Number(rows[0]?.count || 0);
-}
-
 async function saveTaskTimeEntryStates(taskId, entries) {
   const normalizedTaskId = String(taskId);
   const now = new Date().toISOString();
@@ -2122,7 +2114,7 @@ async function runTaskTimeEntryBaseline(options = {}) {
   }
 
   const limit = Number.parseInt(options.limit, 10);
-  const maxToProcess = Number.isInteger(limit) && limit > 0 ? limit : 100;
+  const maxToProcess = Number.isInteger(limit) && limit > 0 ? limit : null;
   const force = Boolean(options.force);
   taskTimeCheckInProgress = true;
   taskTimeCheckStartedAt = new Date().toISOString();
@@ -2139,14 +2131,14 @@ async function runTaskTimeEntryBaseline(options = {}) {
       const taskId = String(task?.id || task?.ID || '');
       if (!taskId) continue;
 
-      if (processed.length >= maxToProcess) {
+      if (maxToProcess && processed.length >= maxToProcess) {
         skippedAfterLimit += 1;
         continue;
       }
 
       try {
-        const existingEntries = await getTaskTimeEntryStateCount(taskId);
-        if (existingEntries > 0 && !force) {
+        const existingState = await getTaskTimeState(taskId);
+        if (existingState && !force) {
           skippedExisting += 1;
           continue;
         }
